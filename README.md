@@ -163,10 +163,12 @@ final_project/
 │           └── event.json
 └── annotations/
     └── 183/
-        ├── bowl/
-        ├── spoon/
-        ├── cabinet_door/
-        └── drawer/
+    |   ├── bowl/
+    |   ├── cabinet_door/
+    |   └── drawer/
+    └── 183/
+        └── spoon/
+
 ```
 
 ## Environment and Reproducibility

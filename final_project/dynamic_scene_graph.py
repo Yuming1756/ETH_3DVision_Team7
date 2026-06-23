@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import open3d as o3d
+# import open3d as o3d
 from scipy.spatial import KDTree
 
 
