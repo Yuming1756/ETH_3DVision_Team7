@@ -58,35 +58,38 @@ ETH_3DVision_Team7/
 ├── README.md
 │
 ├── final_project/                    # main code snapshot
-│   ├── graph.py                      # main pipeline entry point
-│   ├── dynamic_scene_graph.py         # dynamic functional scene graph data structure
-│   ├── json_utils.py
-│   ├── visualize_graph.py             # PLY / OpenFunGraph-style graph visualization
+|   ├── visualize_graph.py             # PLY / OpenFunGraph-style graph visualization
 │   ├── visualize_scene_graph_html_multi_status.py
+│   ├── eval.py                        # evaluation script
+│   ├── viser_io.py                    # viser based visualisation script
 │   ├── requirements.txt               # portable Python dependencies
 │   ├── requirements_git.txt           # Git-based dependencies
 │   ├── requirements_torch_cuda126.txt # optional CUDA 12.6 PyTorch setup
 │   ├── requirements_platform_optional.txt
-│   │
-│   └── graph_sections/
-│       ├── 00_imports_config.py
-│       ├── 01_labels_relations.py
-│       ├── 02_geometry.py
-│       ├── 03_frames_pose_hands.py
-│       ├── 04_frames_clips.py
-│       ├── 05_perception.py
-│       ├── 06_boxes_masks.py
-│       ├── 07_tracking.py
-│       ├── 08_artipoint_filters.py
-│       ├── 09_articulation_fit.py
-│       ├── 10_artipoint_lostfound.py
-│       ├── 11_vlm_reasoning.py
-│       ├── 12_object_state.py
-│       ├── 13_pointcloud_io.py
-│       ├── 14_geometry_update.py
-│       ├── 15_motion_export.py
-│       ├── 16_inactive_depth_cache.py
-│       └── 17_pipeline_main.py
+│   ├── temp/                         # main pipeline entry point
+│   |   ├── graph.py                      # main pipeline entry point
+│   |   ├── dynamic_scene_graph.py         # dynamic functional scene graph data structure
+│   |   ├── json_utils.py 
+│   |   │
+│       └── graph_sections/
+│          ├── 00_imports_config.py
+│          ├── 01_labels_relations.py
+│          ├── 02_geometry.py
+│          ├── 03_frames_pose_hands.py
+│          ├── 04_frames_clips.py
+│          ├── 05_perception.py
+│          ├── 06_boxes_masks.py
+│          ├── 07_tracking.py
+│          ├── 08_artipoint_filters.py
+│          ├── 09_articulation_fit.py
+│          ├── 10_artipoint_lostfound.py
+│          ├── 11_vlm_reasoning.py
+│          ├── 12_object_state.py
+│          ├── 13_pointcloud_io.py
+│          ├── 14_geometry_update.py
+│          ├── 15_motion_export.py
+│          ├── 16_inactive_depth_cache.py
+│          └── 17_pipeline_main.py
 │
 └── team7_env_export/                 # environment and model manifests
     ├── README_REPRODUCE.md
@@ -124,10 +127,12 @@ should look like this:
 
 ```text
 final_project/
-├── graph.py
-├── graph_sections/
-├── dynamic_scene_graph.py
-├── json_utils.py
+├── temp 
+|  ├── graph.py
+|  ├── dynamic_scene_graph.py
+|  ├── json_utils.py
+|  └── graph_sections/
+|
 ├── visualize_graph.py
 ├── visualize_scene_graph_html_multi_status.py
 ├── eval.py
@@ -407,7 +412,7 @@ object-motion estimation.
 Example direct invocation:
 
 ```bash
-python3 graph.py \
+python3 final_project/temp/graph.py \
   --data-dir data/open-source-183_extracted \
   --frame-start 280 \
   --frame-end 690 \
@@ -556,7 +561,7 @@ available, articulation-axis errors.
 Example:
 
 ```bash
-python3 eval.py \
+python3 final_project/eval.py \
   --output_dir output/output_final_183_long \
   --groundtruth_dir annotations/183/bowl \
   --label "bowl"
@@ -586,7 +591,7 @@ fungraph/
 
 Example:
 ```text
-python3 visualize_graph.py \
+python3 final_project/visualize_graph.py \
   --scene-graph-dir output/output_final_183_long/scene_graph \
   --scene-ply output/output_final_183_long/scene_full.ply \
   --out-dir output/output_final_183_long \
