@@ -359,6 +359,7 @@ For stricter reproduction, the relevant Qwen and DA3 snapshot hashes are:
 On a new machine, restore all external files into a local, untracked
 external/ directory:
 
+```
 ETH_3DVision_Team7/
 ├── final_project/
 ├── team7_env_export/
@@ -372,6 +373,7 @@ ETH_3DVision_Team7/
         └── cotracker3/
             ├── scaled_online.pth
             └── scaled_offline.pth
+```
 
 ### Restoring HuggingFace models
 
@@ -800,19 +802,19 @@ Example:
 ```bash
 python3 eval.py \
   --output_dir output/output_final_183_long \
-  --groundtruth_dir annotations/183/bowl \
+  --groundtruth_dir final_project/annotations/183/bowl \
   --label "bowl"
 ```
+which will calculate the metrics for the trajectory of the bowl.
 
-Other evaluated labels include:
-```text
-spoon
-bowl
-cabinet door
-drawer
-```
+The other options for our evaluation are `spoon`(using scene 307), `cabinet door`, `drawer`.
 
-Arguments:
+`output_dir` should be a directory of the output of our pipeline
+
+`groundtruth_dir` should be a directory containing ground truth annotations
+
+`label` should be the label of the node for which the metrics are ran
+
 
 
 ## Visualization
