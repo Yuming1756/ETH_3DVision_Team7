@@ -55,14 +55,18 @@ The submitted package is expected to have the following structure:
 
 ```text
 ETH_3DVision_Team7/
-├── README.md                         
+├── README.md
 │
 ├── final_project/                    # main code snapshot
-│   ├── graph.py
-│   ├── dynamic_scene_graph.py
+│   ├── graph.py                      # main pipeline entry point
+│   ├── dynamic_scene_graph.py         # dynamic functional scene graph data structure
 │   ├── json_utils.py
-│   ├── visualize_graph.py
+│   ├── visualize_graph.py             # PLY / OpenFunGraph-style graph visualization
 │   ├── visualize_scene_graph_html_multi_status.py
+│   ├── requirements.txt               # portable Python dependencies
+│   ├── requirements_git.txt           # Git-based dependencies
+│   ├── requirements_torch_cuda126.txt # optional CUDA 12.6 PyTorch setup
+│   ├── requirements_platform_optional.txt
 │   │
 │   └── graph_sections/
 │       ├── 00_imports_config.py
@@ -86,8 +90,12 @@ ETH_3DVision_Team7/
 │
 └── team7_env_export/                 # environment and model manifests
     ├── README_REPRODUCE.md
-    ├── requirements.txt
-    ├── requirements_freeze.txt
+    ├── requirements.txt               # portable dependency file
+    ├── requirements_git.txt           # Git-based dependencies
+    ├── requirements_torch_cuda126.txt # optional CUDA 12.6 PyTorch setup
+    ├── requirements_platform_optional.txt
+    ├── requirements_freeze.txt        # exact ETH cluster pip freeze
+    ├── requirements_local_success.txt # one tested local installation record
     ├── environment_full.yml
     ├── environment_from_history.yml
     ├── conda_list.txt
@@ -162,44 +170,137 @@ final_project/
 ```
 
 ## Environment and Reproducibility
-The Python package requirements are listed in:
+This section describes the recommended procedure for setting up the project environment from a clean machine. The repository separates portable dependencies, Git-based dependencies, CUDA/PyTorch dependencies, and optional platform-specific packages because the exact ETH cluster environment is not fully portable.
+
+1. Create a clean Python environment
+
+We recommend Python 3.12.
+
+```bash
+conda create -n team7_3dv python=3.12 -y
+conda activate team7_3dv
+
+python -m pip install --upgrade pip setuptools wheel
+```
+
+3. Install portable Python dependencies
+
+The main portable dependency file is:
 ```text
-requirements.txt
-requirements_freeze.txt
+team7_env_export/requirements.txt
 ```
-
-A basic setup is:
+Install it with:
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+pip install -r team7_env_export/requirements.txt
 ```
+This file is generated from the original cluster environment but removes cluster-local editable paths and highly platform-specific packages.
 
-For a closer reproduction of our cluster environment, we also provide:
+4. Install Git-based dependencies
+
+Some dependencies are installed directly from GitHub and are listed separately in:
 ```text
-environment_full.yml
-environment_from_history.yml
-conda_list.txt
-conda_explicit.txt
-pip_list.txt
-package_versions.txt
-nvidia_smi.txt
-nvcc_version.txt
+team7_env_export/requirements_git.txt
+```
+Install them with:
+```bash
+pip install -r team7_env_export/requirements_git.txt
+```
+If a GitHub clone fails because of a temporary network issue, rerun the command. These dependencies include external tracking/depth packages used by the pipeline.
+
+5. Install PyTorch / CUDA dependencies
+
+PyTorch is installed separately because the correct wheel depends on the local NVIDIA driver and CUDA compatibility.
+
+For a CUDA 12.6-compatible Linux GPU setup, use:
+
+pip install -r team7_env_export/requirements_torch_cuda126.txt
+
+This setup was tested locally with:
+```text
+Python 3.12
+PyTorch 2.10.0+cu126
+NVIDIA RTX 3090
+```
+After installation, verify CUDA visibility:
+```bash
+python - <<'PY'
+import torch
+
+print("torch:", torch.__version__)
+print("torch cuda version:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+print("device count:", torch.cuda.device_count())
+
+if torch.cuda.is_available():
+    print("device name:", torch.cuda.get_device_name(0))
+PY
+```
+Expected output should include:
+```text
+cuda available: True
+```
+If CUDA is not available, the most likely cause is a mismatch between the installed PyTorch CUDA wheel and the local NVIDIA driver. In that case, install the PyTorch wheel matching the target machine instead of using the provided CUDA 12.6 file.
+
+6. Install optional platform-specific packages
+
+Some packages are useful but not required for every setup. They are listed in:
+```text
+team7_env_export/requirements_platform_optional.txt
+```
+Install them only if needed:
+```bash
+pip install -r team7_env_export/requirements_platform_optional.txt
+```
+Examples:
+
+- open3d
+    Required for PLY-based graph visualization through visualize_graph.py.
+
+- projectaria-tools
+    Only needed if raw Project Aria / VRS data must be processed.
+    It is not required for the provided extracted MicroAGI-style RGB/depth/pose workflow.
+7. Verify the installation
+
+Run a basic import check from the repository root:
+```bash
+python - <<'PY'
+packages = [
+    ("numpy", "numpy"),
+    ("cv2", "cv2"),
+    ("torch", "torch"),
+    ("transformers", "transformers"),
+    ("accelerate", "accelerate"),
+    ("cotracker", "cotracker"),
+    ("depth_anything_3", "depth_anything_3"),
+]
+
+for name, modname in packages:
+    try:
+        mod = __import__(modname)
+        print(f"{name}: OK", getattr(mod, "__version__", ""))
+    except Exception as e:
+        print(f"{name}: FAILED -> {e}")
+PY
 ```
 
-A conda environment can be recreated with:
-```bash
-conda env create -f environment_full.yml
-conda activate <env_name>
-pip install -r requirements_freeze.txt
-```
+8. Exact environment records
 
-If environment_full.yml is platform-specific, use the lighter history file:
-```bash
-conda env create -f environment_from_history.yml
-conda activate <env_name>
-pip install -r requirements_freeze.txt
+The following files are included for reproducibility documentation:
+```text
+team7_env_export/requirements_freeze.txt
+team7_env_export/requirements_local_success.txt
+team7_env_export/environment_full.yml
+team7_env_export/environment_from_history.yml
+team7_env_export/conda_list.txt
+team7_env_export/pip_list.txt
+team7_env_export/package_versions.txt
+team7_env_export/nvidia_smi.txt
+team7_env_export/nvcc_version.txt
 ```
+requirements_freeze.txt records the exact ETH cluster environment. It should be treated as a reference record, not as the default installation file, because it may contain cluster-local paths, CUDA-specific wheels, and platform-specific package versions.
+
+requirements_local_success.txt records one successfully installed local environment after the portable, Git-based, CUDA, and optional packages were installed.
+
 
 ## External Models
 Large model weights are not included in the code snapshot. The model

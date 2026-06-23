@@ -1,0 +1,14 @@
+# Optional platform-specific packages.
+# Install only on a compatible Linux/Python/GPU machine if needed.
+
+# Visualization / point-cloud export
+open3d==0.19.0
+
+# Raw Project Aria / VRS tooling, only needed if processing raw Aria data.
+# Not required for the provided extracted frame/depth workflow.
+projectaria-tools==2.1.1
+
+# Optional GPU optimization packages.
+# Install only if compatible with your CUDA/PyTorch version.
+# xformers
+# bitsandbytes
