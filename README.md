@@ -323,14 +323,15 @@ The main external components used by the pipeline are:
 - Qwen-VL : Used for interaction reasoning, functional element/object identification,
 functional relation prediction, object-state inference, seed-frame selection,
 and label-candidate reasoning.
-- Depth Anything 3 (DA3) : Used for metric depth estimation when --use-da3 is enabled.
+- Depth Anything 3 (DA3) : Used for metric depth estimation when --use-da3 is enabled. (https://github.com/ByteDance-Seed/depth-anything-3)
+- Artipoint : used for articulation points. (https://github.com/robot-learning-freiburg/artipoint)
 - SAM3 : Used for open-vocabulary video mask propagation and object/element segmentation. SAM3 requires both a local SAM3 source folder and the
-facebook/sam3 HuggingFace model/checkpoint cache.
-- LostFound / hand-object detector: Used for hand-object contact detection and automatic active/inactive clip
+facebook/sam3 HuggingFace model/checkpoint cache. ("https://github.com/facebookresearch/sam3")
+- LostFound / hand-object detector: Used for hand-object contact detection and automatic active/inactive clip 
 segmentation. This is required for reproducing the full automatic pipeline
-from the extracted RGB-D sequence.
+from the extracted RGB-D sequence.(https://github.com/behretj/LostFound)
 - CoTracker3: Used for 2D point tracking in rigid and articulated motion estimation.
-The CoTracker3 checkpoints must be restored separately.
+The CoTracker3 checkpoints must be restored separately. (https://github.com/facebookresearch/co-tracker)
 - GTSAM : Used for factor-graph fitting in articulated motion estimation.
 - Open3D : Used for point-cloud processing and PLY export.
 
