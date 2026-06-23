@@ -49,3 +49,19 @@ checkpoints/
 # Logs
 *.log
 slurm-*.out
+
+# Local external models / checkpoints / caches
+external/
+.cache/
+huggingface/
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+local_external_env.sh
+/sam3
+final_project/data/
+final_project/output/

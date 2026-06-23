@@ -1,17 +1,123 @@
-]633;E;{   echo "Project root:"\x3b   pwd\x3b   echo\x3b   echo "Important local folders:"\x3b   ls -ld sam3 SAM3-I temp graph_sections 2>/dev/null || true\x3b   echo\x3b   echo "Possible model/checkpoint files:"\x3b   find . -maxdepth 5 \\(     -name "*.pt" -o     -name "*.pth" -o     -name "*.ckpt" -o     -name "*.safetensors"   \\) -exec ls -lh {} \\\x3b 2>/dev/null\x3b } > "$EXPORT/model_and_sam3_manifest.txt";27a29c73-7ec4-4093-b40f-0cefc826380c]633;CProject root:
-/work/courses/3dv/team7
+Dynamic Functional 3D Scene Graph
+External Source / Checkpoint Manifest
 
-Important local folders:
-drwxrwxr-x+  9 fedlin fedlin-group 16 Mar 28 12:52 sam3
-drwxrwx---+ 18 fedlin fedlin-group 52 Jun 23 03:01 temp
+## Purpose
 
-Possible model/checkpoint files:
--rw-rw----+ 1 fedlin fedlin-group 97M May 27 18:22 ./checkpoints/cotracker3/scaled_online.pth
--rw-rw----+ 1 fedlin fedlin-group 98M May 27 18:12 ./checkpoints/cotracker3/scaled_offline.pth
--rw-rw-r--+ 1 fedlin fedlin-group 662M Mar 21  2023 ./checkpoints/GroundingDINO/weights/groundingdino_swint_ogc.pth
--rw-rwx---+ 1 fedlin fedlin-group 79 Mar 28 13:12 ./venv/lib/python3.12/site-packages/__editable__.sam3-0.1.0.pth
--rw-rwx---+ 1 fedlin fedlin-group 97 Mar 23 16:51 ./venv/lib/python3.12/site-packages/__editable__.groundingdino-0.1.0.pth
--rw-rw----+ 1 fedlin fedlin-group 195 Jun  4 21:44 ./venv/lib/python3.12/site-packages/_cuda_bindings_redirector.pth
--rw-rwx---+ 1 fedlin fedlin-group 10 Apr  7 00:13 ./venv/lib/python3.12/site-packages/rerun_sdk.pth
--rw-rw----+ 1 fedlin fedlin-group 151 Jun  4 21:00 ./venv/lib/python3.12/site-packages/distutils-precedence.pth
--rw-rwx---+ 1 fedlin fedlin-group 77 Apr  1 02:07 ./venv/lib/python3.12/site-packages/__editable__.ram-0.0.1.pth
+This file documents external source folders and checkpoint files that were used
+in the ETH cluster environment but are not included in the GitHub repository.
+
+These files must be restored separately on a new machine if the corresponding
+pipeline components are used.
+
+## Recommended local layout
+
+ETH_3DVision_Team7/
+├── final_project/
+├── team7_env_export/
+└── external/
+├── src/
+│   └── sam3/
+└── checkpoints/
+├── cotracker3/
+└── GroundingDINO/
+└── weights/
+
+## SAM3 source
+
+Cluster source folder:
+/work/courses/3dv/team7/sam3
+
+Recommended local location:
+external/src/sam3/
+
+Restore example:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/src
+
+rsync -av --progress 
+yuchen2@student-cluster2:/work/courses/3dv/team7/sam3/ 
+external/src/sam3/
+
+Install example:
+
+conda activate team7_3dv
+pip install -e external/src/sam3
+
+Notes:
+SAM3 was installed as a local editable source package in the original cluster
+environment. It is therefore not fully restored by the portable requirements
+file alone.
+
+## CoTracker checkpoints
+
+Cluster checkpoint files:
+
+/work/courses/3dv/team7/checkpoints/cotracker3/scaled_online.pth
+/work/courses/3dv/team7/checkpoints/cotracker3/scaled_offline.pth
+
+Approximate sizes from the cluster scan:
+
+scaled_online.pth   97 MB
+scaled_offline.pth  98 MB
+
+Recommended local location:
+
+external/checkpoints/cotracker3/
+
+Restore example:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/checkpoints/cotracker3
+
+rsync -av --progress 
+yuchen2@student-cluster2:/work/courses/3dv/team7/checkpoints/cotracker3/ 
+external/checkpoints/cotracker3/
+
+## GroundingDINO checkpoint
+
+Cluster checkpoint file:
+
+/work/courses/3dv/team7/checkpoints/GroundingDINO/weights/groundingdino_swint_ogc.pth
+
+Approximate size from the cluster scan:
+
+groundingdino_swint_ogc.pth  662 MB
+
+Recommended local location:
+
+external/checkpoints/GroundingDINO/weights/
+
+Restore example:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/checkpoints/GroundingDINO/weights
+
+rsync -av --progress 
+yuchen2@student-cluster2:/work/courses/3dv/team7/checkpoints/GroundingDINO/weights/groundingdino_swint_ogc.pth 
+external/checkpoints/GroundingDINO/weights/
+
+## Other local editable packages
+
+The original cluster environment also contained editable installs for local
+source packages such as SAM3, GroundingDINO, and Recognize Anything / RAM.
+These are recorded in the exact environment files, but their source trees are
+not included in this repository.
+
+If a specific run requires one of these packages, restore the corresponding
+source folder separately and install it with:
+
+pip install -e external/src/<package_name>
+
+## Repository policy
+
+Do not commit the following files to GitHub:
+
+* external/
+* model checkpoints
+* .pth / .pt / .ckpt / .safetensors / .bin files
+* local editable source trees
+* raw datasets
+* previous output runs
+
+These files should remain local and are documented here for reproducibility.

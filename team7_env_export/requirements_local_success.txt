@@ -74,7 +74,7 @@ fqdn==1.5.1
 frozenlist==1.8.0
 fsspec==2026.2.0
 ftfy==6.1.1
-gdown==6.0.0
+gdown==6.1.0
 gguf==0.19.0
 googleapis-common-protos==1.75.0
 grpcio==1.81.0
@@ -221,6 +221,7 @@ polars-runtime-32==1.39.3
 portalocker==3.2.0
 pre_commit==4.5.1
 proglog==0.1.12
+projectaria-tools==2.1.1
 prometheus-fastapi-instrumentator==8.0.0
 prometheus_client==0.24.1
 prompt_toolkit==3.0.52
@@ -276,6 +277,7 @@ rpds-py==0.30.0
 rtree==1.4.1
 ruamel.yaml==0.19.1
 safetensors==0.7.0
+-e git+https://github.com/facebookresearch/sam3.git@5a3143c652ac41c28b788a419b40ec424d0f6aab#egg=sam3
 scikit-learn==1.8.0
 scipy==1.17.1
 seaborn==0.13.2

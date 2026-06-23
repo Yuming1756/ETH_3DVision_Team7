@@ -172,7 +172,7 @@ final_project/
 ## Environment and Reproducibility
 This section describes the recommended procedure for setting up the project environment from a clean machine. The repository separates portable dependencies, Git-based dependencies, CUDA/PyTorch dependencies, and optional platform-specific packages because the exact ETH cluster environment is not fully portable.
 
-1. Create a clean Python environment
+### Create a clean Python environment
 
 We recommend Python 3.12.
 
@@ -183,7 +183,7 @@ conda activate team7_3dv
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-3. Install portable Python dependencies
+### Install portable Python dependencies
 
 The main portable dependency file is:
 ```text
@@ -195,7 +195,7 @@ pip install -r team7_env_export/requirements.txt
 ```
 This file is generated from the original cluster environment but removes cluster-local editable paths and highly platform-specific packages.
 
-4. Install Git-based dependencies
+### Install Git-based dependencies
 
 Some dependencies are installed directly from GitHub and are listed separately in:
 ```text
@@ -207,7 +207,7 @@ pip install -r team7_env_export/requirements_git.txt
 ```
 If a GitHub clone fails because of a temporary network issue, rerun the command. These dependencies include external tracking/depth packages used by the pipeline.
 
-5. Install PyTorch / CUDA dependencies
+### Install PyTorch / CUDA dependencies
 
 PyTorch is installed separately because the correct wheel depends on the local NVIDIA driver and CUDA compatibility.
 
@@ -241,7 +241,7 @@ cuda available: True
 ```
 If CUDA is not available, the most likely cause is a mismatch between the installed PyTorch CUDA wheel and the local NVIDIA driver. In that case, install the PyTorch wheel matching the target machine instead of using the provided CUDA 12.6 file.
 
-6. Install optional platform-specific packages
+### Install optional platform-specific packages
 
 Some packages are useful but not required for every setup. They are listed in:
 ```text
@@ -259,7 +259,7 @@ Examples:
 - projectaria-tools
     Only needed if raw Project Aria / VRS data must be processed.
     It is not required for the provided extracted MicroAGI-style RGB/depth/pose workflow.
-7. Verify the installation
+### Verify the installation
 
 Run a basic import check from the repository root:
 ```bash
@@ -283,7 +283,7 @@ for name, modname in packages:
 PY
 ```
 
-8. Exact environment records
+### Exact environment records
 
 The following files are included for reproducibility documentation:
 ```text
@@ -302,39 +302,279 @@ requirements_freeze.txt records the exact ETH cluster environment. It should be 
 requirements_local_success.txt records one successfully installed local environment after the portable, Git-based, CUDA, and optional packages were installed.
 
 
-## External Models
-Large model weights are not included in the code snapshot. The model
-configuration and local cache snapshots are documented in:
+## External Models and Runtime Assets
+
+Large model weights, HuggingFace cache folders, local source trees, checkpoints,
+raw data, and previous output runs are not included in this repository. They
+must be restored separately on the target machine.
+
+The external model and checkpoint records are documented in:
 ```text
-model_and_sam3_manifest.txt
-da3_qwen_manifest.txt
-hf_model_snapshots.txt
+team7_env_export/model_and_sam3_manifest.txt
+team7_env_export/da3_qwen_manifest.txt
+team7_env_export/hf_model_snapshots.txt
 ```
-Main external models/components:
+### Required external components
 
-- SAM3 / SAM3-I: open-vocabulary video mask propagation.
-- DepthAnything3: metric depth estimation when DA3 is enabled.
-- Qwen-VL: element/object detection, functional relation prediction,
-object-state inference, seed-frame selection, and recall@K label candidates.
-- CoTracker3: 2D point tracking for rigid and articulated motion.
-- GTSAM: factor-graph fitting for articulated motion.
-- Open3D: point-cloud processing and PLY export.
+The main external components used by the pipeline are:
 
-The HuggingFace models used in the final run were:
+- Qwen-VL : Used for interaction reasoning, functional element/object identification,
+functional relation prediction, object-state inference, seed-frame selection,
+and label-candidate reasoning.
+- Depth Anything 3 (DA3) : Used for metric depth estimation when --use-da3 is enabled.
+- SAM3 : Used for open-vocabulary video mask propagation and object/element segmentation. SAM3 requires both a local SAM3 source folder and the
+facebook/sam3 HuggingFace model/checkpoint cache.
+- LostFound / hand-object detector: Used for hand-object contact detection and automatic active/inactive clip
+segmentation. This is required for reproducing the full automatic pipeline
+from the extracted RGB-D sequence.
+- CoTracker3: Used for 2D point tracking in rigid and articulated motion estimation.
+The CoTracker3 checkpoints must be restored separately.
+- GTSAM : Used for factor-graph fitting in articulated motion estimation.
+- Open3D : Used for point-cloud processing and PLY export.
+
+### HuggingFace models
+
+The HuggingFace models used in the final setup are:
+
+- Qwen-VL: Qwen/Qwen3-VL-4B-Instruct
+
+- Depth Anything 3: depth-anything/DA3NESTED-GIANT-LARGE-1.1
+
+- SAM3: facebook/sam3
+
+The Qwen and DA3 snapshot hashes used on the ETH cluster are recorded in:
 ```text
-Qwen-VL: Qwen/Qwen3-VL-4B-Instruct
-DA3: depth-anything/DA3NESTED-GIANT-LARGE-1.1
+team7_env_export/hf_model_snapshots.txt
 ```
 
-The local snapshot hashes are recorded in **hf_model_snapshots.txt**.
+For stricter reproduction, the relevant Qwen and DA3 snapshot hashes are:
 
-For offline reproduction, copy the HuggingFace cache folders listed in
-**hf_model_snapshots.txt** and set:
+- Qwen/Qwen3-VL-4B-Instruct: ebb281ec70b05090aa6165b016eac8ec08e71b17
+
+- depth-anything/DA3NESTED-GIANT-LARGE-1.1: b2359bdf726fb44ef62acca04d629dcf158053e7
+### Recommended local layout
+
+On a new machine, restore all external files into a local, untracked
+external/ directory:
+
+ETH_3DVision_Team7/
+├── final_project/
+├── team7_env_export/
+└── external/
+    ├── hf_cache/
+    │   └── hub/
+    ├── src/
+    │   ├── sam3/
+    │   └── lostfound/
+    └── checkpoints/
+        └── cotracker3/
+            ├── scaled_online.pth
+            └── scaled_offline.pth
+
+### Restoring HuggingFace models
+
+Create a local HuggingFace cache:
+```bash
+cd ~/ETH_3DVision_Team7
+mkdir -p external/hf_cache
+
+export HF_HOME=$PWD/external/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+
+If HuggingFace authentication is needed:
+
+hf auth login
+
+Download Qwen-VL and DA3:
+
+python - <<'PY'
+from huggingface_hub import snapshot_download
+
+models = [
+    "Qwen/Qwen3-VL-4B-Instruct",
+    "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+]
+
+for model_id in models:
+    print(f"Downloading {model_id} ...")
+    path = snapshot_download(repo_id=model_id)
+    print(f"{model_id} -> {path}")
+PY
+```
+
+SAM3 additionally requires access to the gated HuggingFace repository
+facebook/sam3. If the target account has access, download it with:
 
 ```bash
-export HF_HOME=/path/to/copied/huggingface_cache
+python - <<'PY'
+from huggingface_hub import snapshot_download
+
+path = snapshot_download(repo_id="facebook/sam3")
+print("facebook/sam3 ->", path)
+PY
+
+If the target account does not have access to facebook/sam3, copy the
+pre-downloaded models--facebook--sam3 HuggingFace cache folder from a machine
+where access has already been granted.
+
+After all HuggingFace models have been restored, offline/cache-only execution can
+be enabled with:
+
+export HF_HOME=$PWD/external/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
 export HF_HUB_OFFLINE=1
+Verifying Qwen and DA3
+
+Check the local Qwen snapshot:
+
+cd ~/ETH_3DVision_Team7
+
+QWEN_DIR=$(find "$PWD/external/hf_cache/hub" -type d \
+  -path "*models--Qwen--Qwen3-VL-4B-Instruct/snapshots/*" | head -n 1)
+
+python - <<PY
+from transformers import AutoConfig, AutoProcessor
+
+model_path = "$QWEN_DIR"
+
+config = AutoConfig.from_pretrained(
+    model_path,
+    local_files_only=True,
+    trust_remote_code=True,
+)
+
+processor = AutoProcessor.from_pretrained(
+    model_path,
+    local_files_only=True,
+    trust_remote_code=True,
+)
+
+print("Qwen config loaded:", config.model_type)
+print("Qwen processor loaded")
+PY
 ```
+
+Check the local DA3 snapshot:
+```bash
+DA3_DIR=$(find "$PWD/external/hf_cache/hub" -type d \
+  -path "*models--depth-anything--DA3NESTED-GIANT-LARGE-1.1/snapshots/*" | head -n 1)
+
+python - <<PY
+from pathlib import Path
+
+da3_dir = Path("$DA3_DIR")
+print("DA3 dir:", da3_dir)
+print("exists:", da3_dir.exists())
+print("files:", [p.name for p in da3_dir.iterdir()])
+PY
+```
+The DA3 snapshot should contain files such as:
+```text
+config.json
+model.safetensors
+Restoring SAM3 source
+```
+SAM3 should be restored as a local source dependency. For example, if copying
+from the ETH cluster:
+```bash
+cd ~/ETH_3DVision_Team7
+mkdir -p external/src
+
+rsync -av --progress \
+  yuchen2@student-cluster2.inf.ethz.ch:/work/courses/3dv/team7/sam3/ \
+  external/src/sam3/
+
+Install SAM3 into the active environment:
+
+conda activate team7_3dv
+pip install -e external/src/sam3
+
+For compatibility with the project code, create a symlink at the repository root:
+
+cd ~/ETH_3DVision_Team7
+ln -sfn external/src/sam3 sam3
+```
+Verify SAM3:
+```bash
+python - <<'PY'
+import sam3
+from sam3.model_builder import build_sam3_video_predictor
+
+print("sam3:", sam3.__file__)
+print("SAM3 video predictor builder: OK")
+PY
+```
+Restoring CoTracker3 checkpoints
+
+Copy the CoTracker3 checkpoints:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/checkpoints/cotracker3
+
+rsync -av --progress \
+  yuchen2@student-cluster2.inf.ethz.ch:/work/courses/3dv/team7/checkpoints/cotracker3/ \
+  external/checkpoints/cotracker3/
+
+Expected files:
+
+external/checkpoints/cotracker3/scaled_online.pth
+external/checkpoints/cotracker3/scaled_offline.pth
+Restoring LostFound
+
+For full automatic clip segmentation, restore LostFound as a local source
+folder:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/src
+
+rsync -av --progress \
+  yuchen2@student-cluster2.inf.ethz.ch:/work/courses/3dv/team7/temp/thirdparty/lostfound/ \
+  external/src/lostfound/
+
+Expose it to the project code:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p final_project/thirdparty
+ln -sfn ../../external/src/lostfound final_project/thirdparty/lostfound
+
+LostFound also requires projectaria-tools. If it is not installed yet:
+
+pip install projectaria-tools==2.1.1
+
+Verify that LostFound is available:
+
+cd ~/ETH_3DVision_Team7/final_project
+
+python - <<'PY'
+import graph
+
+print("LOSTFOUND_AVAILABLE:", graph.LOSTFOUND_AVAILABLE)
+print("hand_object_detection:", graph.hand_object_detection is not None)
+print("load_faster_rcnn:", graph.load_faster_rcnn is not None)
+PY
+
+Expected output:
+
+LOSTFOUND_AVAILABLE: True
+hand_object_detection: True
+load_faster_rcnn: True
+Local external environment script
+
+For convenience, create a local setup script:
+
+cd ~/ETH_3DVision_Team7
+
+cat > local_external_env.sh <<'EOF'
+export PROJECT_ROOT=$HOME/ETH_3DVision_Team7
+
+export HF_HOME=$PROJECT_ROOT/external/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+export HF_HUB_OFFLINE=1
+
+export COTRACKER3_CHECKPOINT_DIR=$PROJECT_ROOT/external/checkpoints/cotracker3
+export COTRACKER3_OFFLINE_CHECKPOINT_PATH=$COTRACKER3_CHECKPOINT_DIR/scaled_offline.pth
+export COTRACKER3_ONLINE_CHECKPOINT_PATH=$COTRACKER3_CHECKPOINT_DIR/scaled_online.pth
+EOF
 
 ## Code Layout
 The main pipeline is split into section files under **graph_sections/**.

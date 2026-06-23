@@ -1,42 +1,128 @@
-HuggingFace model snapshot manifest
-Generated from local cache scan
+HuggingFace Model Snapshot Manifest
 
-==========================================================================================
-CACHE ROOT: /work/courses/3dv/team7/.cache/huggingface
-SIZE: 20G
+## Purpose
 
-------------------------------------------------------------------------------------------
-MODEL CACHE DIR: /work/courses/3dv/team7/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct
-MODEL CACHE SIZE: 8.3G
-REFS:
-  main: ebb281ec70b05090aa6165b016eac8ec08e71b17
-SNAPSHOTS:
-  snapshot: ebb281ec70b05090aa6165b016eac8ec08e71b17
-  path: /work/courses/3dv/team7/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
-  size: 7.0K
-  has config.json: yes
-  has preprocessor_config.json: yes
-  has tokenizer_config.json: yes
-  weight files: 2
-    model-00001-of-00002.safetensors (512)
-    model-00002-of-00002.safetensors (512)
+This file records the exact HuggingFace model snapshots found in the ETH cluster
+cache for the submitted dynamic functional 3D scene graph project.
 
-------------------------------------------------------------------------------------------
-MODEL CACHE DIR: /work/courses/3dv/team7/.cache/huggingface/hub/models--depth-anything--DA3NESTED-GIANT-LARGE-1.1
-MODEL CACHE SIZE: 6.3G
-REFS:
-  main: b2359bdf726fb44ef62acca04d629dcf158053e7
-SNAPSHOTS:
-  snapshot: b2359bdf726fb44ef62acca04d629dcf158053e7
-  path: /work/courses/3dv/team7/.cache/huggingface/hub/models--depth-anything--DA3NESTED-GIANT-LARGE-1.1/snapshots/b2359bdf726fb44ef62acca04d629dcf158053e7
-  size: 1.0K
-  has config.json: yes
-  weight files: 1
-    model.safetensors (512)
+The actual HuggingFace cache and model weights are not included in the GitHub
+repository.
 
-==========================================================================================
-CACHE ROOT: /home/yuchen2/.cache/huggingface
-SIZE: 48M
+## Cluster cache root
 
-No Qwen or depth-anything model caches found under this root.
+/work/courses/3dv/team7/.cache/huggingface
 
+Approximate total cache size:
+
+20 GB
+
+## Model 1: Qwen-VL
+
+Model ID:
+
+Qwen/Qwen3-VL-4B-Instruct
+
+Cluster cache directory:
+
+/work/courses/3dv/team7/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct
+
+Cluster cache size:
+
+approximately 8.3 GB
+
+Snapshot hash:
+
+ebb281ec70b05090aa6165b016eac8ec08e71b17
+
+Cluster snapshot path:
+
+/work/courses/3dv/team7/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+
+Detected metadata files:
+
+config.json: yes
+preprocessor_config.json: yes
+tokenizer_config.json: yes
+
+Detected model weight files:
+
+model-00001-of-00002.safetensors
+model-00002-of-00002.safetensors
+
+## Model 2: Depth Anything 3
+
+Model ID:
+
+depth-anything/DA3NESTED-GIANT-LARGE-1.1
+
+Cluster cache directory:
+
+/work/courses/3dv/team7/.cache/huggingface/hub/models--depth-anything--DA3NESTED-GIANT-LARGE-1.1
+
+Cluster cache size:
+
+approximately 6.3 GB
+
+Snapshot hash:
+
+b2359bdf726fb44ef62acca04d629dcf158053e7
+
+Cluster snapshot path:
+
+/work/courses/3dv/team7/.cache/huggingface/hub/models--depth-anything--DA3NESTED-GIANT-LARGE-1.1/snapshots/b2359bdf726fb44ef62acca04d629dcf158053e7
+
+Detected metadata files:
+
+config.json: yes
+
+Detected model weight files:
+
+model.safetensors
+
+## Recreating the same snapshots on a new machine
+
+Recommended local cache layout:
+
+ETH_3DVision_Team7/
+└── external/
+└── hf_cache/
+└── hub/
+
+Example setup:
+
+cd ~/ETH_3DVision_Team7
+mkdir -p external/hf_cache
+
+export HF_HOME=$PWD/external/hf_cache
+export HF_HUB_CACHE=$HF_HOME/hub
+
+Example exact-snapshot download:
+
+python - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+repo_id="Qwen/Qwen3-VL-4B-Instruct",
+revision="ebb281ec70b05090aa6165b016eac8ec08e71b17",
+)
+
+snapshot_download(
+repo_id="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+revision="b2359bdf726fb44ef62acca04d629dcf158053e7",
+)
+PY
+
+## Notes
+
+1. The cluster paths above are documentation only. They do not need to exist on
+   a new machine.
+
+2. The small file sizes sometimes shown for files inside HuggingFace snapshot
+   folders may refer to symlinks. The actual model blobs are stored elsewhere
+   inside the HuggingFace cache.
+
+3. HuggingFace access tokens are not included in this repository.
+
+4. To run offline after downloading the snapshots, set:
+
+   export HF_HUB_OFFLINE=1
