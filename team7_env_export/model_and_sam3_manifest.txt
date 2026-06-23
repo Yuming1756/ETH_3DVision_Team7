@@ -1,0 +1,17 @@
+]633;E;{   echo "Project root:"\x3b   pwd\x3b   echo\x3b   echo "Important local folders:"\x3b   ls -ld sam3 SAM3-I temp graph_sections 2>/dev/null || true\x3b   echo\x3b   echo "Possible model/checkpoint files:"\x3b   find . -maxdepth 5 \\(     -name "*.pt" -o     -name "*.pth" -o     -name "*.ckpt" -o     -name "*.safetensors"   \\) -exec ls -lh {} \\\x3b 2>/dev/null\x3b } > "$EXPORT/model_and_sam3_manifest.txt";27a29c73-7ec4-4093-b40f-0cefc826380c]633;CProject root:
+/work/courses/3dv/team7
+
+Important local folders:
+drwxrwxr-x+  9 fedlin fedlin-group 16 Mar 28 12:52 sam3
+drwxrwx---+ 18 fedlin fedlin-group 52 Jun 23 03:01 temp
+
+Possible model/checkpoint files:
+-rw-rw----+ 1 fedlin fedlin-group 97M May 27 18:22 ./checkpoints/cotracker3/scaled_online.pth
+-rw-rw----+ 1 fedlin fedlin-group 98M May 27 18:12 ./checkpoints/cotracker3/scaled_offline.pth
+-rw-rw-r--+ 1 fedlin fedlin-group 662M Mar 21  2023 ./checkpoints/GroundingDINO/weights/groundingdino_swint_ogc.pth
+-rw-rwx---+ 1 fedlin fedlin-group 79 Mar 28 13:12 ./venv/lib/python3.12/site-packages/__editable__.sam3-0.1.0.pth
+-rw-rwx---+ 1 fedlin fedlin-group 97 Mar 23 16:51 ./venv/lib/python3.12/site-packages/__editable__.groundingdino-0.1.0.pth
+-rw-rw----+ 1 fedlin fedlin-group 195 Jun  4 21:44 ./venv/lib/python3.12/site-packages/_cuda_bindings_redirector.pth
+-rw-rwx---+ 1 fedlin fedlin-group 10 Apr  7 00:13 ./venv/lib/python3.12/site-packages/rerun_sdk.pth
+-rw-rw----+ 1 fedlin fedlin-group 151 Jun  4 21:00 ./venv/lib/python3.12/site-packages/distutils-precedence.pth
+-rw-rwx---+ 1 fedlin fedlin-group 77 Apr  1 02:07 ./venv/lib/python3.12/site-packages/__editable__.ram-0.0.1.pth

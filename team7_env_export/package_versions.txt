@@ -1,0 +1,20 @@
+Python executable: /work/courses/3dv/team7/venv/bin/python
+Python version: 3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]
+
+torch: 2.10.0+cu128
+torchvision: 0.25.0+cu128
+torchaudio: NOT FOUND (Could not load this library: /work/courses/3dv/team7/venv/lib/python3.12/site-packages/torchaudio/lib/libtorchaudio.abi3.so)
+numpy: 1.26.4
+cv2: 4.13.0
+open3d: 0.19.0
+transformers: 5.5.0
+qwen_vl_utils: unknown
+scipy: 1.17.1
+sklearn: 1.8.0
+PIL: 12.1.1
+tqdm: 4.67.3
+gtsam: unknown
+depth_anything_3: unknown
+
+torch.cuda.is_available: False
+torch.version.cuda: 12.8

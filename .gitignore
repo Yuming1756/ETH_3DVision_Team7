@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments
+venv/
+.venv/
+env/
+.env/
+conda-env/
+*.egg-info/
+
+# Data and outputs
+data/
+output/
+outputs/
+output*/
+annotations/
+runs/
+wandb/
+
+# Model/checkpoint/cache files
+.cache/
+huggingface/
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Large generated assets
+*.ply
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+slurm-*.out
