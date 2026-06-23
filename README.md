@@ -166,7 +166,7 @@ final_project/
     |   ├── bowl/
     |   ├── cabinet_door/
     |   └── drawer/
-    └── 183/
+    └── 307/
         └── spoon/
 
 ```
