@@ -16,7 +16,6 @@ data/
 output/
 outputs/
 output*/
-annotations/
 runs/
 wandb/
 

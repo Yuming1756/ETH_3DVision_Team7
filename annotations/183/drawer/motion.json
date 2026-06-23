@@ -1,0 +1,18 @@
+{
+    "scene_id": "drawer_000788",
+    "annot_id": "96b5ff74-e06b-4354-951a-4b8ca3a00b08",
+    "motion_id": "b85c0689-9416-4ff3-af03-9e41c318947f",
+    "motion_type": "trans",
+    "motion_origin_idx": 11536,
+    "motion_origin_pos": [
+        0.06323636311021544,
+        -1.2194866417918153,
+        0.8425311895465036
+    ],
+    "motion_dir": [
+        -0.2788268673074313,
+        0.9498201008902252,
+        0.14176513680170655
+    ],
+    "motion_viz_orient": "outwards"
+}

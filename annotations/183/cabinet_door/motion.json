@@ -1,0 +1,18 @@
+{
+    "scene_id": "cabinet_door_000318",
+    "annot_id": "358033af-d38f-407e-9e77-64ff818e96bd",
+    "motion_id": "a45a29ff-f8a0-440f-9cb5-3ba5d47ac6df",
+    "motion_type": "rot",
+    "motion_origin_idx": 24839,
+    "motion_origin_pos": [
+        0.7479410171508789,
+        0.8952808380126953,
+        1.6686441898345947
+    ],
+    "motion_dir": [
+        0,
+        0,
+        1
+    ],
+    "motion_viz_orient": "outwards"
+}
