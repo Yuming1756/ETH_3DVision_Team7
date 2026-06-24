@@ -175,6 +175,31 @@ def load_all_frames(
     if failure_counts:
         breakdown_str = ", ".join(f"{k}={v}" for k, v in sorted(failure_counts.items(), key=lambda kv: -kv[1]))
         print(f"  contact-failure breakdown (per frame): {breakdown_str}")
+    # Per-frame detail for frames where a HAND was detected but contact still
+    # failed (i.e. NOT a total "no detection"). Pinpoints which of the three
+    # prerequisites dropped — object detector missing/low-conf, or the per-hand
+    # "in-contact" flag off — so a still-touching interaction whose contact flag
+    # vanished (e.g. fridge once the door swings open) can be explained exactly
+    # instead of lumped into "missing_dets".
+    detail_rows: List[str] = []
+    for sample in samples:
+        bd = sample.get("hand_contact_breakdown") or {}
+        if bd.get("contact") or not bd.get("hand_dets_present"):
+            continue
+        first_failure = bd.get("first_failure")
+        reason = first_failure
+        if first_failure == "missing_dets":
+            reason = "obj_dets_missing" if not bd.get("obj_dets_present") else "hand_dets_missing"
+        detail_rows.append(
+            f"    frame {int(sample.get('prefix', -1))}: {reason} "
+            f"(hand@{float(bd.get('best_hand_score', 0.0)):.2f}, "
+            f"obj@{float(bd.get('best_obj_score', 0.0)):.2f}, "
+            f"in_contact={bool(bd.get('hand_in_contact'))})"
+        )
+    if detail_rows:
+        print(f"  contact-failure detail (hand detected, no contact), {len(detail_rows)} frame(s):")
+        for row in detail_rows:
+            print(row)
     return samples
 
 
@@ -365,9 +390,18 @@ def interpolate_missing_wrist_positions(clip_samples: Sequence[dict]) -> None:
 
 
 def infer_smoothed_contact_flags(samples: Sequence[dict], radius: int = SMOOTH_FALLBACK_RADIUS) -> None:
-    """Populate a smoothed contact signal as a fallback when strict LostFound gating yields no active clip."""
+    """Populate a smoothed interaction-active signal for clip segmentation."""
     for idx, sample in enumerate(samples):
         window = samples[max(0, idx - radius) : min(len(samples), idx + radius + 1)]
+        # Smooth the RAW per-frame contact, NOT the latched ``interaction_active``.
+        # ``interaction_active`` is a state machine that latches ON at the first
+        # contact frame and is held across gaps by the look-ahead, so a single
+        # spurious RCNN contact (e.g. the hand reaching over an object one frame
+        # before the real grasp) would pin the active clip's onset there and eat
+        # the pre-grasp rest frames -> no inactive clip -> no prior. Smoothing the
+        # raw ``hand_contact`` lets the radius-N majority vote actually reject such
+        # isolated single-frame contacts, so the active clip starts at the first
+        # sustained grasp run and the rest frames before it form the inactive clip.
         positives = sum(1 for item in window if item.get("hand_contact", False))
         sample["smoothed_contact_active"] = positives > (len(window) // 2)
 
@@ -447,6 +481,62 @@ def apply_active_flag_postroll(
     return changed
 
 
+def bridge_active_flag_gaps(
+    samples: Sequence[dict],
+    flag_key: str,
+    max_gap_frames: int = ACTIVE_CLIP_BRIDGE_GAP_FRAMES,
+) -> int:
+    """Fill SHORT inactive holes inside a single continuous interaction.
+
+    A brief mid-manipulation detection dropout (hand+object occluded for a few
+    frames before reappearing in the SAME carry/motion) flips the active flag to
+    False for that hole, which otherwise splits one interaction into two clips and
+    strands the tracker (it cannot re-acquire across the gap). We re-activate any
+    inactive run of length <= ``max_gap_frames`` that is flanked by active frames
+    on BOTH sides. Runs at a frame/pose-block boundary (``_sample_requires_new_clip``)
+    are NOT bridged, so genuine clip splits and longer (real) inter-interaction
+    gaps are preserved.
+    """
+    if max_gap_frames <= 0 or not samples:
+        return 0
+    original = [bool(sample.get(flag_key, False)) for sample in samples]
+    expanded = list(original)
+    n = len(samples)
+    idx = 0
+    while idx < n:
+        if original[idx]:
+            idx += 1
+            continue
+        # [start, end) is a maximal inactive run
+        start = idx
+        while idx < n and not original[idx]:
+            idx += 1
+        end = idx
+        # Must be flanked by active frames on both sides (not a leading/trailing run)
+        if start == 0 or end >= n:
+            continue
+        gap_len = end - start
+        if gap_len > max_gap_frames:
+            continue
+        # Do not bridge across a frame/pose-block discontinuity anywhere in the run
+        # (including the two flanking transitions).
+        discontinuous = False
+        for j in range(start, end + 1):
+            if _sample_requires_new_clip(samples[j - 1], samples[j]):
+                discontinuous = True
+                break
+        if discontinuous:
+            continue
+        for j in range(start, end):
+            expanded[j] = True
+    changed = 0
+    for sample, new_value in zip(samples, expanded):
+        if bool(sample.get(flag_key, False)) != bool(new_value):
+            changed += 1
+        sample[flag_key] = bool(new_value)
+    return changed
+
+
 def summarize_scene_graph_match(match_debug: dict) -> str:
     """Format one geometry-aware node-match decision for logs."""
     if not match_debug:
@@ -468,6 +558,12 @@ def segment_clips(samples: Sequence[dict], mode: str = "smoothed") -> List[ClipI
     """Split samples into alternating inactive and active clips using the requested segmentation mode."""
     infer_interaction_flags(samples)
     infer_smoothed_contact_flags(samples)
+    def _g(flag):
+        return [int(s.get("prefix", -1)) for s in samples if s.get(flag)]
+    print(f"[SegDebug] RAW strict interaction_active frames: {_g('interaction_active')}")
+    print(f"[SegDebug] RAW smoothed_contact_active frames: {_g('smoothed_contact_active')}")
+    print(f"[SegDebug] proximity_contact frames: {_g('proximity_contact')}")
+    print(f"[SegDebug] hand_contact frames: {_g('hand_contact')}")
     strict_preroll_changed = apply_active_flag_preroll(samples, "interaction_active")
     smoothed_preroll_changed = apply_active_flag_preroll(samples, "smoothed_contact_active")
     if strict_preroll_changed or smoothed_preroll_changed:
@@ -482,6 +578,15 @@ def segment_clips(samples: Sequence[dict], mode: str = "smoothed") -> List[ClipI
             f"[ClipSegmentation] applied active postroll={ACTIVE_CLIP_POSTROLL_FRAMES} "
             f"(strict +{strict_postroll_changed} frames, smoothed +{smoothed_postroll_changed} frames)"
         )
+    strict_bridge_changed = bridge_active_flag_gaps(samples, "interaction_active")
+    smoothed_bridge_changed = bridge_active_flag_gaps(samples, "smoothed_contact_active")
+    if strict_bridge_changed or smoothed_bridge_changed:
+        print(
+            f"[ClipSegmentation] bridged short contact dropouts (<= {ACTIVE_CLIP_BRIDGE_GAP_FRAMES} frames): "
+            f"strict +{strict_bridge_changed} frames, smoothed +{smoothed_bridge_changed} frames"
+        )
+    print(f"[SegDebug] POST-ROLL strict interaction_active frames: {_g('interaction_active')}")
+    print(f"[SegDebug] POST-ROLL smoothed_contact_active frames: {_g('smoothed_contact_active')}")
     if mode == "strict_lostfound":
         clips = _build_clips_from_flag(samples, "interaction_active")
     elif mode == "auto":
@@ -496,6 +601,22 @@ def segment_clips(samples: Sequence[dict], mode: str = "smoothed") -> List[ClipI
             raise RuntimeError(msg)
     else:
         clips = _build_clips_from_flag(samples, "smoothed_contact_active")
+        n_active = sum(1 for clip in clips if not clip.is_inactive)
+        if n_active == 0 and any(sample.get("proximity_contact", False) for sample in samples):
+            for sample in samples:
+                sample["contact_fallback_active"] = bool(sample.get("proximity_contact", False))
+            cf_preroll_changed = apply_active_flag_preroll(samples, "contact_fallback_active")
+            cf_postroll_changed = apply_active_flag_postroll(samples, "contact_fallback_active")
+            print(
+                "[ClipSegmentation] smoothed-contact produced 0 active clips; "
+                "falling back to raw proximity contact."
+            )
+            print(
+                f"[ClipSegmentation] proximity-contact fallback expanded by preroll +{cf_preroll_changed} "
+                f"and postroll +{cf_postroll_changed} frame(s)"
+            )
+            print(f"[SegDebug] contact_fallback_active frames: {_g('contact_fallback_active')}")
+            clips = _build_clips_from_flag(samples, "contact_fallback_active")
     for clip in clips:
         if not clip.is_inactive:
             clip.interaction_hand = choose_clip_interaction_hand(clip.samples)
@@ -558,5 +679,3 @@ def sanitize_rgb_sequence_for_perception(
         replacement_idx = min(valid_indices, key=lambda valid_idx: abs(valid_idx - idx))
         sanitized.append(np.asarray(rgb_list[replacement_idx], dtype=np.uint8).copy())
     return sanitized
-
-

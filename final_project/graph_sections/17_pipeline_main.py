@@ -6,6 +6,47 @@
 # namespace via exec(); names from earlier sections are in scope here.
 # ======================================================================
 from __future__ import annotations
+
+
+class Sam3Manager:
+    """Build the SAM3 video predictor ONCE and keep it resident for the whole video.
+
+    SAM3 only needs to co-exist with CoTracker3, and since CoTracker now runs in
+    ONLINE/streaming mode (constant ~window-bounded memory, not whole-clip), the two
+    fit on the GPU together. So there is no need to release/rebuild SAM3 per clip --
+    and doing so was actively harmful: repeated large alloc/free cycles fragmented
+    the CUDA caching allocator and crept the baseline up ~1.2 GiB by mid-video,
+    which then OOM'd the Qwen detection forward. Build once, free once at the end.
+
+    ``release()`` is therefore a deliberate NO-OP (per-clip callers stay wired but
+    don't churn the model); ``shutdown()`` does the single real teardown.
+    """
+
+    def __init__(self, config: "PipelineConfig") -> None:
+        self._config = config
+        self._predictor: Optional[Any] = None
+
+    def get(self) -> Any:
+        if self._predictor is None:
+            self._predictor = build_configured_sam3_video_predictor(self._config)
+        return self._predictor
+
+    def release(self) -> None:
+        # NO-OP: keep SAM3 resident (online CoTracker fits alongside). Rebuilding it
+        # per clip fragmented GPU memory and caused the Qwen OOM.
+        return
+
+    def shutdown(self) -> None:
+        if self._predictor is not None:
+            try:
+                self._predictor.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[Sam3Manager] shutdown raised ({exc}); continuing.")
+            self._predictor = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
+
 def process_inactive_clip(
     clip: ClipInfo,
     K_depth: np.ndarray,
@@ -20,7 +61,7 @@ def process_inactive_clip(
     rgb_list: Optional[Sequence[np.ndarray]] = None,
     T_wc_list: Optional[Sequence[np.ndarray]] = None,
     inactive_stride: int = 1,
-    sam3_predictor: Optional[Any] = None,
+    sam3_manager: Optional["Sam3Manager"] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Run inactive reconstruction.
 
@@ -29,6 +70,7 @@ def process_inactive_clip(
     DA3 metric depth map instead of routing geometry through the native depth
     rays.
     """
+    sam3_predictor = sam3_manager.get() if sam3_manager is not None else None
     print()
     print(f"=== Clip {clip.clip_id} [INACTIVE] frames {clip.frame_start}-{clip.frame_end} ===")
     using_da3_depth = clip_depths is not None and rgb_list is not None and T_wc_list is not None
@@ -134,9 +176,10 @@ def process_active_clip(
     previous_inactive_clip: Optional[ClipInfo],
     depth_cache_dir: Optional[Path],
     config: PipelineConfig,
-    sam3_predictor: Optional[Any] = None,
+    sam3_manager: Optional["Sam3Manager"] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Run the active-mode graph-only update pipeline from precomputed clip depths."""
+    sam3_predictor = sam3_manager.get() if sam3_manager is not None else None
     print()
     print(f"=== Clip {clip.clip_id} [ACTIVE] frames {clip.frame_start}-{clip.frame_end} ===")
 
@@ -162,6 +205,94 @@ def process_active_clip(
     first_sample = clip.samples[active_anchor_idx]
     interaction_anchor_box, detected_object_anchor_box = select_interaction_anchor_boxes(first_sample, rgb_list[active_anchor_idx].shape)
     primary_hand_anchor_xy = select_primary_hand_anchor_point(first_sample, rgb_list[active_anchor_idx].shape)
+    support_context_labels = {
+        "bowl",
+        "plate",
+        "dish",
+        "rack",
+        "holder",
+        "table",
+        "counter",
+        "countertop",
+        "shelf",
+        "sink",
+        "bin",
+        "basket",
+    }
+    tool_like_tokens = {
+        "spoon",
+        "fork",
+        "knife",
+        "ladle",
+        "spatula",
+        "whisk",
+        "tongs",
+        "mug",
+        "cup",
+        "bottle",
+        "jar",
+        "can",
+    }
+    if (
+        tracked_obj_label in support_context_labels
+        or any(tok in elem_label for tok in tool_like_tokens)
+        or any(tok in tracked_obj_label for tok in tool_like_tokens)
+    ):
+        inactive_rgb_for_hierarchy = None
+        if previous_inactive_clip is not None and previous_inactive_clip.samples:
+            for inactive_sample in reversed(previous_inactive_clip.samples):
+                if not inactive_sample.get("rgb_valid", True):
+                    continue
+                bgr = cv2.imread(str(inactive_sample["rgb_path"]))
+                if bgr is None:
+                    continue
+                inactive_rgb_for_hierarchy = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                break
+        later_valid_idx = next(
+            (idx for idx in range(len(clip.samples) - 1, -1, -1) if clip.samples[idx].get("rgb_valid", True)),
+            active_anchor_idx,
+        )
+        later_sample = clip.samples[later_valid_idx]
+        later_box, _ = select_interaction_anchor_boxes(later_sample, rgb_list[later_valid_idx].shape)
+        hierarchy_result = infer_interaction_hierarchy(
+            qwen_bundle,
+            rgb_list[active_anchor_idx],
+            interaction_anchor_box,
+            inactive_frame_rgb=inactive_rgb_for_hierarchy,
+            later_frame_rgb=rgb_list[later_valid_idx] if later_valid_idx != active_anchor_idx else None,
+            later_interaction_bbox=later_box if later_valid_idx != active_anchor_idx else None,
+            element_hint=elem_label,
+            object_hint=tracked_obj_label,
+        )
+        detection["hierarchy_recheck"] = hierarchy_result
+        refined_elem = str(hierarchy_result.get("interactive_element", "")).strip().lower()
+        refined_obj = str(hierarchy_result.get("parent_object", "")).strip().lower()
+        refined_conf = float(hierarchy_result.get("confidence", 0.0))
+        suspicious_support_parent = tracked_obj_label in support_context_labels and any(
+            tok in refined_obj for tok in tool_like_tokens
+        )
+        suspicious_generic_pair = refined_conf >= 0.6 and (
+            tracked_obj_label in NON_INTERACTABLE
+            or elem_label in NON_INTERACTABLE
+        )
+        if suspicious_support_parent or suspicious_generic_pair:
+            print(
+                "  [QwenHierarchyOverride] "
+                f"video detector suggested '{elem_label}' -> '{tracked_obj_label}', "
+                f"crop hierarchy refined to '{refined_elem}' -> '{refined_obj}' "
+                f"(conf={refined_conf:.2f})"
+            )
+            if refined_elem:
+                elem_label = refined_elem
+            if refined_obj:
+                tracked_obj_label = refined_obj
+            detection["interactive_element"] = elem_label
+            detection["parent_object"] = tracked_obj_label
+            detection["reasoning"] = (
+                str(detection.get("reasoning", "")).strip()
+                + " | hierarchy_recheck: "
+                + str(hierarchy_result.get("reasoning", "")).strip()
+            ).strip(" |")
     qwen_parent_body_label = tracked_obj_label
     motion_coupling = infer_motion_coupling(
         qwen_bundle,
@@ -202,214 +333,207 @@ def process_active_clip(
             tracked_obj_label,
             str(motion_coupling.get("reasoning", "")),
         )
-    shared_is_articulated_motion = (
-        bool(motion_coupling.get("shares_rigid_motion", False))
+    # Two independent decisions, deliberately decoupled:
+    #
+    #  (1) use_active_object_sam3 — run the active-SAM3 + inactive-prior +
+    #      active-trajectory segmentation with the first/last-active-frame seed
+    #      logic. This applies to BOTH articulated objects AND rigid-transport
+    #      carries (spoon/mug carried as one rigid body).
+    #
+    #  (2) is_truly_articulated_motion — fit a 1-DoF ArtiPoint JOINT and use the
+    #      ArtiPoint tracker + hand-anchor mask stabilization. This applies ONLY
+    #      to genuinely articulated objects. A carried rigid object has no joint,
+    #      so it keeps LostFound 6-DoF rigid-pose math and SKIPS the joint fit
+    #      (matching the original working behavior). Crucially, the hand-anchor
+    #      mask stabilization (which assumes element+object are co-located at the
+    #      hand) must NOT run for a rigid pair whose object can be away from the
+    #      hand — that is what collapsed the object mask.
+    use_active_object_sam3 = bool(
+        motion_coupling.get("shares_rigid_motion", False)
+        and (
+            is_articulated_object_motion(motion_coupling, elem_label, tracked_obj_label)
+            or qwen_interaction_type == "rigid_transport"
+        )
+    )
+    is_truly_articulated_motion = bool(
+        motion_coupling.get("shares_rigid_motion", False)
         and is_articulated_object_motion(motion_coupling, elem_label, tracked_obj_label)
     )
-    if shared_is_articulated_motion:
-        print("  using active SAM3 because articulated tracking requires active object masks")
+    # Holds the single unified cross-clip SAM3 session result (one seed per label,
+    # propagated both ways). Defined for BOTH the active-SAM3 and the fallback paths
+    # so the inactive-prior section can reuse it (or None) without a NameError.
+    _unified_cross_result = None
+    if use_active_object_sam3:
+        if is_truly_articulated_motion:
+            print("  using active SAM3 because articulated tracking requires active object masks")
+        else:
+            print("  using active SAM3 for rigid-transport object (LostFound rigid-pose tracking, no joint fit)")
+        # Let Qwen choose whether SAM seeds at the BEGINNING / MIDDLE / END of the
+        # active clip (begin/mid/end frames + last inactive frame for context).
+        # Prismatic parts (drawer) are clearest at the END once fully revealed;
+        # revolute doors (cabinet) at the BEGINNING before rotation foreshortens
+        # them. Computed while Qwen is still loaded, just before release. Applies to
+        # BOTH articulated and rigid objects.
+        try:
+            _seed_endpoint = infer_sam_seed_endpoint(
+                qwen_bundle,
+                clip,
+                rgb_list,
+                elem_label,
+                tracked_obj_label,
+                motion_coupling=motion_coupling,
+                previous_inactive_clip=previous_inactive_clip,
+            )
+            sam_seed_choice = str(_seed_endpoint.get("seed_choice", "end")).strip().lower()
+            print(
+                f"  Qwen SAM seed choice for '{tracked_obj_label}': {sam_seed_choice} "
+                f"(conf={float(_seed_endpoint.get('confidence', 0.0)):.2f}) — {_seed_endpoint.get('reasoning', '')}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            sam_seed_choice = "end"
+            print(f"  [seed-endpoint] Qwen seed-choice failed ({exc}); defaulting to '{sam_seed_choice}'.")
+        if sam_seed_choice not in {"beginning", "middle", "end"}:
+            sam_seed_choice = "end"
+        # Best INACTIVE frame to seed the ELEMENT (handle), picked by Qwen while it is
+        # still loaded. The element is now seeded from the ACTIVE clip (like the
+        # object): Qwen picks a BINARY first-active ('beginning') or last-active
+        # ('end') frame where the handle is the cleanest single instance.
+        element_seed_choice = "beginning"
+        if elem_label and str(elem_label) != str(tracked_obj_label):
+            try:
+                _elem_seed = infer_element_seed_frame(
+                    qwen_bundle, rgb_list, elem_label, tracked_obj_label,
+                )
+                element_seed_choice = str(_elem_seed.get("seed_choice", "beginning")).strip().lower()
+                print(
+                    f"  Qwen element seed choice for '{elem_label}': {element_seed_choice} (active) "
+                    f"(conf={float(_elem_seed.get('confidence', 0.0)):.2f}) — {_elem_seed.get('reasoning', '')}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                element_seed_choice = "beginning"
+                print(f"  [element-seed] Qwen element seed-choice failed ({exc}); defaulting to 'beginning'.")
+        if element_seed_choice not in {"beginning", "end"}:
+            element_seed_choice = "beginning"
         release_qwen_bundle(qwen_bundle)
         print("  released Qwen before active SAM3 segmentation")
-        element_prompt_specs = [
-            {
-                "label": elem_label,
-                "text": build_interaction_aware_sam_text(
-                    elem_label,
-                    interactive_element=elem_label,
-                    parent_object=tracked_obj_label,
-                    role="element",
-                    active=True,
-                ),
-                "frame_index": active_anchor_idx,
-            }
-        ]
-        element_masks_dict, prompt_hand_masks, element_masks_metadata = run_sam3_prompt_specs(
-            config.jpeg_dir,
-            element_prompt_specs,
-            HAND_PROMPTS,
-            len(rgb_list),
-            color_w,
-            color_h,
-            predictor=sam3_predictor,
-        )
-        detector_hand_masks = [
-            np.asarray(prompt_hand_masks[idx], dtype=bool) if idx < len(prompt_hand_masks) else np.zeros(rgb_list[idx].shape[:2], dtype=bool)
-            for idx in range(len(rgb_list))
-        ]
-        raw_active_elem_masks = [np.asarray(mask, dtype=bool).copy() for mask in element_masks_dict[elem_label]]
-        elem_masks = stabilize_mask_sequence_near_anchor(
-            element_masks_dict[elem_label],
-            primary_hand_anchor_xy,
-        )
-        element_anchor_box = mask_to_bbox(elem_masks[active_anchor_idx]) if elem_masks else None
-        if element_anchor_box is None:
-            element_anchor_box = interaction_anchor_box
-        # Choose the object prompt frame from a CLEAN element (handle) observation
-        # rather than the last valid frame. The handle mask tends to bloat toward
-        # the end of a long active clip (SAM3 loses the small handle and grabs the
-        # drawer/background), so the last frame yields a huge element bbox that
-        # expands to a full-frame object box -> SAM3 then over-segments the whole
-        # drawer-front row inconsistently. Among valid frames we pick the smallest
-        # non-trivial element mask (the tightest true-handle observation) so the
-        # element-anchored object box stays on the one moving part.
-        _valid_elem_idx = [
-            idx for idx, mask in enumerate(elem_masks)
-            if clip.samples[idx].get("rgb_valid", True) and np.any(mask)
-        ]
-        if _valid_elem_idx:
-            _elem_areas = {
-                idx: int(np.count_nonzero(np.asarray(elem_masks[idx], dtype=bool)))
-                for idx in _valid_elem_idx
-            }
-            # "Clean" element frames are those whose handle mask has NOT drifted/
-            # bloated (area within ~2x the median). Among them pick the LATEST,
-            # because the moving part is most open/distinct late in the pull — a
-            # too-early frame (drawer barely open) gives SAM3 nothing to propagate
-            # the body from (observed: frame 13 -> 17/42 object frames), while the
-            # latest-clean frame keeps the handle tight AND the drawer open.
-            _median_area = float(np.median([_elem_areas[idx] for idx in _valid_elem_idx]))
-            _clean_elem_idx = [
-                idx for idx in _valid_elem_idx
-                if _elem_areas[idx] >= 64 and _elem_areas[idx] <= max(2.0 * _median_area, 64.0)
-            ]
-            _elem_pool = _clean_elem_idx if _clean_elem_idx else _valid_elem_idx
-            object_prompt_frame_idx = max(_elem_pool)
-        else:
-            object_prompt_frame_idx = active_anchor_idx
-        object_prompt_sample = clip.samples[object_prompt_frame_idx]
-        object_prompt_interaction_box, object_prompt_detected_object_box = select_interaction_anchor_boxes(
-            object_prompt_sample,
-            rgb_list[object_prompt_frame_idx].shape,
-        )
-        prompt_element_anchor_box = mask_to_bbox(elem_masks[object_prompt_frame_idx]) if elem_masks else None
-        if prompt_element_anchor_box is None:
-            prompt_element_anchor_box = element_anchor_box
-        object_anchor_box = select_object_anchor_box(
-            object_prompt_sample,
-            rgb_list[object_prompt_frame_idx].shape,
-            elem_masks[object_prompt_frame_idx] if elem_masks else None,
-            fallback_object_box=object_prompt_detected_object_box or object_prompt_interaction_box,
-            hint_object_box=None,
-        )
-        element_motion_anchor_box = element_anchor_box
-        if prompt_element_anchor_box is not None:
-            element_motion_anchor_box = (
-                min(int(element_anchor_box[0]), int(prompt_element_anchor_box[0])),
-                min(int(element_anchor_box[1]), int(prompt_element_anchor_box[1])),
-                max(int(element_anchor_box[2]), int(prompt_element_anchor_box[2])),
-                max(int(element_anchor_box[3]), int(prompt_element_anchor_box[3])),
-            )
+        clip_dir = config.output_dir / f"clip_{clip.clip_id:03d}"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        # Seed frame from Qwen's begin/middle/end choice mapped DIRECTLY onto the
+        # valid active frames (no element-mask dependency, no box). One frame for
+        # everything.
+        _valid_active = [idx for idx in range(len(rgb_list)) if clip.samples[idx].get("rgb_valid", True)] or list(range(len(rgb_list)))
+        if sam_seed_choice == "beginning":
+            object_prompt_frame_idx = _valid_active[0]
+        elif sam_seed_choice == "middle":
+            object_prompt_frame_idx = _valid_active[len(_valid_active) // 2]
+        else:  # "end"
+            object_prompt_frame_idx = _valid_active[-1]
+        object_anchor_box = None
         object_crop_box = None
-        # Anchor the active object SAM3 prompt with the object box (normalized
-        # xywh, as SAM3-I requires). Text alone lets the large object body
-        # (e.g. a drawer) drop to empty masks during propagation while the small
-        # element survives; the box gives the propagation a spatial seed so the
-        # body is actually tracked across the clip.
-        object_prompt_box_norm = (
-            box_xyxy_to_normalized_xywh(object_anchor_box, rgb_list[object_prompt_frame_idx].shape)
-            if object_anchor_box is not None
-            else None
+        object_prompt_box_norm = None
+        element_anchor_box = None
+        # ===== UNIFIED CROSS-CLIP SAM3 — one seed per label, propagated both ways =====
+        # Seed the element + object (+ hands) ONCE at the Qwen-chosen active frame
+        # and propagate forward through active AND backward into inactive in a
+        # SINGLE SAM3 session. The active portion drives keypoint tracking; the
+        # inactive portion (reused in the prior section below) is the prior. Pure
+        # text grounding, no boxes, no crop.
+        print(
+            f"  unified SAM3 (text-only, no box/crop): single seed for '{elem_label}' + "
+            f"'{tracked_obj_label}' at active frame {object_prompt_frame_idx} ({sam_seed_choice}); "
+            f"propagating both ways across inactive+active."
         )
-        object_prompt_specs = [
-            {
-                "label": tracked_obj_label,
-                "text": build_interaction_aware_sam_text(
+        unified_cross = None
+        if previous_inactive_clip is not None:
+            try:
+                unified_cross = run_cross_clip_object_session(
+                    previous_inactive_clip,
                     tracked_obj_label,
-                    interactive_element=elem_label,
-                    parent_object=tracked_obj_label,
-                    role="object",
-                    active=True,
-                ),
-                "frame_index": object_prompt_frame_idx,
-                "disable_bootstrap_boxes": True,
-                "bounding_boxes": [object_prompt_box_norm] if object_prompt_box_norm is not None else None,
-                "bounding_box_labels": [1] if object_prompt_box_norm is not None else None,
-            }
-        ]
-        if object_prompt_box_norm is not None:
+                    config,
+                    K_depth,
+                    K_color,
+                    D_color,
+                    T_depth_color,
+                    color_w,
+                    color_h,
+                    depth_cache_dir,
+                    sam_rgb_list,
+                    object_prompt_frame_idx,
+                    debug_dir=clip_dir,
+                    sam3_predictor=sam3_predictor,
+                    preferred_hand=clip.interaction_hand,
+                    element_label=elem_label,
+                    hand_prompts=HAND_PROMPTS,
+                    element_seed_choice=element_seed_choice,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [unified-sam] cross-clip session failed ({exc}); falling back to separate active seeds.")
+                unified_cross = None
+        _unified_cross_result = None
+        if (
+            unified_cross is not None
+            and unified_cross.get("active_object_masks")
+            and unified_cross.get("active_element_masks")
+        ):
+            _unified_cross_result = unified_cross
+            raw_active_elem_masks = [np.asarray(m, dtype=bool).copy() for m in unified_cross["active_element_masks"]]
+            obj_masks = [np.asarray(m, dtype=bool).copy() for m in unified_cross["active_object_masks"]]
+            _active_hands = unified_cross.get("active_hand_masks", []) or []
+            detector_hand_masks = [
+                np.asarray(_active_hands[idx], dtype=bool) if idx < len(_active_hands) else np.zeros(rgb_list[idx].shape[:2], dtype=bool)
+                for idx in range(len(rgb_list))
+            ]
+            element_masks_metadata = {elem_label: unified_cross.get("active_element_metadata", [])}
+            object_masks_local_metadata = {tracked_obj_label: unified_cross.get("active_object_metadata", [])}
             print(
-                f"  active object SAM3 anchored with box (normalized xywh) "
-                f"{[round(v, 4) for v in object_prompt_box_norm]} on frame {object_prompt_frame_idx}"
+                f"  unified SAM3 active masks: element {sum(1 for m in raw_active_elem_masks if np.any(m))}/"
+                f"{len(raw_active_elem_masks)} non-empty, object "
+                f"{sum(1 for m in obj_masks if np.any(m))}/{len(obj_masks)} non-empty."
             )
-        # Persist the ACTUAL SAM3 object prompt box (red) plus the element box
-        # (green) drawn on the prompt-frame RGB, so the box's accuracy can be
-        # judged directly from the debug output (a full-frame or whole-cabinet
-        # box is exactly what lets SAM3 grab the hand / the wrong drawer).
-        try:
-            box_dbg = np.ascontiguousarray(rgb_list[object_prompt_frame_idx][:, :, ::-1].copy())
-            if object_anchor_box is not None:
-                ox1, oy1, ox2, oy2 = [int(v) for v in object_anchor_box]
-                cv2.rectangle(box_dbg, (ox1, oy1), (ox2, oy2), (0, 0, 255), 4)
-                cv2.putText(box_dbg, f"object box: {tracked_obj_label}", (ox1 + 5, max(oy1 - 10, 26)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-            if element_anchor_box is not None:
-                ex1, ey1, ex2, ey2 = [int(v) for v in element_anchor_box]
-                cv2.rectangle(box_dbg, (ex1, ey1), (ex2, ey2), (0, 200, 0), 3)
-                cv2.putText(box_dbg, f"element box: {elem_label}", (ex1 + 5, min(ey2 + 30, box_dbg.shape[0] - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 0), 2)
-            _box_dbg_dir = config.output_dir / f"clip_{clip.clip_id:03d}" / "tracking_debug"
-            _box_dbg_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(_box_dbg_dir / "object_prompt_box.png"), box_dbg)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [debug] object prompt box overlay failed: {exc}")
-        if os.environ.get("GRAPH_OBJECT_CROP", "0") == "1":
-            # Method 3: segment the object INSIDE an object-centric crop around
-            # the touched handle (using its full motion range) instead of via a
-            # disproportionate full-frame/whole-cabinet prompt box. The crop IS
-            # the localization, so we prompt text-only inside it and paste masks
-            # back to full frame. This excludes distractors (microwave, other
-            # drawers) entirely and removes the box-dimension problem.
-            # Crop SIZE from the object-centric box; per-frame POSITION tracks the
-            # handle so the window follows the moving part (excludes the drawer's
-            # static lower band and other cabinet doors frame-by-frame).
-            object_crop_box = build_object_centric_crop_box(
-                element_motion_anchor_box,
-                object_anchor_box,
-                rgb_list[object_prompt_frame_idx].shape,
+        else:
+            # Fallback: separate active element + object text seeds (no unified session).
+            print(
+                f"  active SAM3 fallback element seed: active local {int(object_prompt_frame_idx)} "
+                f"(global {int(clip.frame_start + object_prompt_frame_idx)}) for '{elem_label}'"
             )
-            _cx1, _cy1, _cx2, _cy2 = [int(v) for v in object_crop_box]
-            _crop_w, _crop_h = max(1, _cx2 - _cx1), max(1, _cy2 - _cy1)
-            # Active object uses a FIXED object-centric crop (per-frame tracking
-            # regressed the drawer joint prismatic->revolute by shifting the masks).
-            _cropped_rgb = crop_rgb_sequence(sam_rgb_list, object_crop_box)
-            _crop_jpeg_dir = config.jpeg_dir.parent / f"{config.jpeg_dir.name}_objcrop"
-            save_jpegs(_cropped_rgb, _crop_jpeg_dir)
-            _crop_specs = [
+            element_prompt_specs = [
+                {
+                    "label": elem_label,
+                    "text": build_interaction_aware_sam_text(
+                        elem_label, interactive_element=elem_label, parent_object=tracked_obj_label,
+                        role="element", active=True,
+                    ),
+                    "frame_index": object_prompt_frame_idx,
+                }
+            ]
+            element_masks_dict, prompt_hand_masks, element_masks_metadata = run_sam3_prompt_specs(
+                config.jpeg_dir, element_prompt_specs, HAND_PROMPTS, len(rgb_list), color_w, color_h, predictor=sam3_predictor,
+            )
+            detector_hand_masks = [
+                np.asarray(prompt_hand_masks[idx], dtype=bool) if idx < len(prompt_hand_masks) else np.zeros(rgb_list[idx].shape[:2], dtype=bool)
+                for idx in range(len(rgb_list))
+            ]
+            raw_active_elem_masks = [np.asarray(mask, dtype=bool).copy() for mask in element_masks_dict[elem_label]]
+            object_prompt_specs = [
                 {
                     "label": tracked_obj_label,
                     "text": build_interaction_aware_sam_text(
-                        tracked_obj_label,
-                        interactive_element=elem_label,
-                        parent_object=tracked_obj_label,
-                        role="object",
-                        active=True,
+                        tracked_obj_label, interactive_element=elem_label, parent_object=tracked_obj_label,
+                        role="object", active=True,
                     ),
                     "frame_index": object_prompt_frame_idx,
                     "disable_bootstrap_boxes": True,
                 }
             ]
             print(
-                f"  [Method3] object-centric crop {_crop_w}x{_crop_h}; "
-                f"segmenting '{tracked_obj_label}' text-only inside crop"
+                f"  active SAM3 fallback object seed: active local {int(object_prompt_frame_idx)} "
+                f"(global {int(clip.frame_start + object_prompt_frame_idx)}) for '{tracked_obj_label}'"
             )
-            _crop_masks_dict, _unused_object_hand_masks, _crop_meta = run_sam3_prompt_specs(
-                _crop_jpeg_dir, _crop_specs, [], len(rgb_list), _crop_w, _crop_h, predictor=sam3_predictor,
-            )
-            obj_masks = uncrop_mask_sequence(
-                _crop_masks_dict[tracked_obj_label], object_crop_box, rgb_list[0].shape[:2]
-            )
-            object_masks_local_metadata = {}  # confidence recomputed downstream from obj_masks
-        else:
             object_masks_local_dict, _unused_object_hand_masks, object_masks_local_metadata = run_sam3_prompt_specs(
-                config.jpeg_dir,
-                object_prompt_specs,
-                [],
-                len(rgb_list),
-                color_w,
-                color_h,
-                predictor=sam3_predictor,
+                config.jpeg_dir, object_prompt_specs, [], len(rgb_list), color_w, color_h, predictor=sam3_predictor,
             )
             obj_masks = object_masks_local_dict[tracked_obj_label]
+        elem_masks = stabilize_mask_sequence_near_anchor(raw_active_elem_masks, primary_hand_anchor_xy)
         active_element_confidence_metadata = element_masks_metadata.get(elem_label, [])
         if not active_element_confidence_metadata:
             active_element_confidence_metadata = compute_sam3_mask_confidence_metadata(
@@ -431,8 +555,13 @@ def process_active_clip(
             f"  SAM3 confidence kept {sum(element_geometry_valids)}/{len(element_geometry_valids)} element frames "
             f"and {sum(object_geometry_valids)}/{len(object_geometry_valids)} object frames for active geometry"
         )
+        # Per-active-frame SAM3 propagation probability (sam3_prob = raw out_probs).
+        _ae_prob = [round(float(m.get("sam3_prob", float("nan"))), 3) for m in active_element_confidence_metadata]
+        _ao_prob = [round(float(m.get("sam3_prob", float("nan"))), 3) for m in active_object_confidence_metadata]
+        print(f"  active element sam3_prob per frame (active 0..{len(_ae_prob)-1}): {_ae_prob}")
+        print(f"  active object  sam3_prob per frame (active 0..{len(_ao_prob)-1}): {_ao_prob}")
         tracking_obj_masks = [np.asarray(mask, dtype=bool).copy() for mask in obj_masks]
-        if shared_is_articulated_motion:
+        if is_truly_articulated_motion:
             tracking_obj_masks = stabilize_mask_sequence_near_anchor(tracking_obj_masks, primary_hand_anchor_xy)
             raw_area_stats = [int(np.count_nonzero(np.asarray(mask, dtype=bool))) for mask in tracking_obj_masks]
             print(
@@ -443,6 +572,10 @@ def process_active_clip(
             print("  articulated active object masks: lightly shrinking masks to reduce boundary leakage")
         elem_masks = constrain_part_masks_inside_object(elem_masks, tracking_obj_masks, primary_hand_anchor_xy)
         obj_body_masks = build_exclusive_object_masks(tracking_obj_masks, elem_masks)
+        shared_motion_masks = [
+            (np.asarray(obj_body_mask, dtype=bool) | np.asarray(elem_mask, dtype=bool))
+            for obj_body_mask, elem_mask in zip(obj_body_masks, elem_masks)
+        ]
         use_da3 = bool(config.use_da3)
         depth_grid = None if use_da3 else build_depth_backprojection_grid(
             K_depth, depth_raw_list[0].shape[0], depth_raw_list[0].shape[1],
@@ -477,7 +610,7 @@ def process_active_clip(
             None if use_da3 else T_cam_depth,
             depth_grid,
             use_da3,
-            pre_eroded_masks=bool(shared_is_articulated_motion),
+            pre_eroded_masks=bool(is_truly_articulated_motion),
         )
         obj_semantic_per_frame = collect_mask_lifted_geometries(
             obj_body_masks,
@@ -493,7 +626,7 @@ def process_active_clip(
             None if use_da3 else T_cam_depth,
             depth_grid,
             use_da3,
-            pre_eroded_masks=bool(shared_is_articulated_motion),
+            pre_eroded_masks=bool(is_truly_articulated_motion),
         )
 
         elem_track_pts, elem_track_cols = geometry_from_indices(elem_per_frame, [idx for idx in range(len(elem_per_frame)) if len(elem_per_frame[idx][0])])
@@ -507,6 +640,10 @@ def process_active_clip(
         init_element_pts, init_element_cols = first_valid_geometry(elem_per_frame)
         init_object_pts, init_object_cols = first_valid_geometry(obj_tracking_per_frame)
         init_object_semantic_pts, init_object_semantic_cols = first_valid_geometry(obj_semantic_per_frame)
+        init_shared_motion_pts, init_shared_motion_cols = stack_point_blocks(
+            [pts for pts in (init_object_semantic_pts, init_element_pts) if len(pts)],
+            [cols for cols in (init_object_semantic_cols, init_element_cols) if len(cols)],
+        )
         final_element_pts, _final_element_cols = geometry_from_indices(elem_per_frame, select_final_geometry_indices(elem_per_frame))
         final_object_pts, _final_object_cols = geometry_from_indices(obj_tracking_per_frame, select_final_geometry_indices(obj_tracking_per_frame))
         final_object_semantic_pts, _final_object_semantic_cols = geometry_from_indices(obj_semantic_per_frame, select_final_geometry_indices(obj_semantic_per_frame))
@@ -532,6 +669,16 @@ def process_active_clip(
         if tracked_obj_label in {"object", "unknown"} and refined_obj_label:
             tracked_obj_label = refined_obj_label
 
+        # Ranked top-5 alternative labels (for recall@K), persisted on the nodes
+        # and in event.json. Text-only (reuses the per-view captions).
+        element_label_candidates = infer_label_candidates(
+            qwen_bundle, element_captions, "element", elem_label, element_desc, top_k=5
+        )
+        object_label_candidates = infer_label_candidates(
+            qwen_bundle, object_captions, "object", tracked_obj_label, object_desc, top_k=5
+        )
+        print(f"  recall@K candidates — element {element_label_candidates} | object {object_label_candidates}")
+
         final_obj_label = tracked_obj_label
         if is_affordance_style_pair(elem_label, final_obj_label):
             relationship = infer_relationship(
@@ -554,65 +701,10 @@ def process_active_clip(
             }
         clip_dir = config.output_dir / f"clip_{clip.clip_id:03d}"
         clip_dir.mkdir(parents=True, exist_ok=True)
-        save_sam3_overlay_png(
-            clip_dir / "sam3_result.png",
-            rgb_list[active_anchor_idx],
-            raw_active_elem_masks[active_anchor_idx] if raw_active_elem_masks else np.zeros(rgb_list[active_anchor_idx].shape[:2], dtype=bool),
-            obj_masks[active_anchor_idx] if obj_masks else np.zeros(rgb_list[active_anchor_idx].shape[:2], dtype=bool),
-            interaction_anchor_box=None,
-            element_anchor_box=element_anchor_box,
-            object_anchor_box=None,
-            object_crop_box=None,
-        )
-        save_sam3_overlay_sequence(
-            clip_dir / "sam3_active_overlays",
-            rgb_list,
-            raw_active_elem_masks,
-            obj_masks,
-            primary_frame_boxes={
-                "element_anchor_box": element_anchor_box,
-            },
-            secondary_frame_index=object_prompt_frame_idx if object_prompt_frame_idx != 0 else None,
-            secondary_frame_boxes={
-                "element_anchor_box": prompt_element_anchor_box or element_anchor_box,
-            },
-        )
-        save_binary_mask_sequence(clip_dir / "sam3_active_masks" / "element_raw", raw_active_elem_masks, "element")
-        save_binary_mask_sequence(clip_dir / "sam3_active_masks" / "element", elem_masks, "element")
-        save_binary_mask_sequence(clip_dir / "sam3_active_masks" / "object_raw", obj_masks, "object")
-        save_binary_mask_sequence(clip_dir / "sam3_active_masks" / "object_body", obj_body_masks, "object")
-        save_binary_mask_sequence(clip_dir / "sam3_active_masks" / "tracking_object", tracking_obj_masks, "object")
-        save_sam3_confidence_json(
-            clip_dir / "sam3_active_masks" / "confidence.json",
-            {
-                "element_label": elem_label,
-                "object_label": tracked_obj_label,
-                "object_metadata_coordinate_frame": "full_image",
-                "object_crop_box_xyxy": None,
-                "element": active_element_confidence_metadata,
-                "object": active_object_confidence_metadata,
-                "element_geometry_valid_frames": [int(i) for i, keep in enumerate(element_geometry_valids) if keep],
-                "object_geometry_valid_frames": [int(i) for i, keep in enumerate(object_geometry_valids) if keep],
-            },
-        )
-        if object_prompt_frame_idx != 0:
-            save_sam3_overlay_png(
-                clip_dir / "sam3_result_object_prompt.png",
-                rgb_list[object_prompt_frame_idx],
-                raw_active_elem_masks[object_prompt_frame_idx] if raw_active_elem_masks else np.zeros(rgb_list[object_prompt_frame_idx].shape[:2], dtype=bool),
-                obj_masks[object_prompt_frame_idx] if obj_masks else np.zeros(rgb_list[object_prompt_frame_idx].shape[:2], dtype=bool),
-                interaction_anchor_box=None,
-                element_anchor_box=prompt_element_anchor_box or element_anchor_box,
-                object_anchor_box=None,
-                object_crop_box=None,
-            )
-            save_box_overlay_png(
-                clip_dir / "object_prompt_boxes.png",
-                rgb_list[object_prompt_frame_idx],
-                [
-                    (prompt_element_anchor_box or element_anchor_box, (255, 80, 80), "element"),
-                ],
-            )
+        # Active SAM3 debug images (sam3_result.png, sam3_active_overlays,
+        # sam3_active_masks/*, object_prompt_boxes.png) removed — only the
+        # consolidated tracking_debug (artipoint <label>_tracks / <label>_masks)
+        # is kept, matching the inactive_prior_debug + tracking_debug pair.
     else:
         print("  non-articulated clip: active SAM3 disabled by design; using inactive priors/LostFound for active geometry")
         final_obj_label = tracked_obj_label
@@ -665,6 +757,7 @@ def process_active_clip(
         init_element_pts, init_element_cols = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
         init_object_pts, init_object_cols = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
         init_object_semantic_pts, init_object_semantic_cols = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        init_shared_motion_pts, init_shared_motion_cols = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
         final_element_pts, final_object_pts, final_object_semantic_pts = (
             np.zeros((0, 3), dtype=np.float32),
             np.zeros((0, 3), dtype=np.float32),
@@ -682,19 +775,30 @@ def process_active_clip(
     if previous_inactive_clip is not None:
         release_qwen_bundle(qwen_bundle)
         print("  released Qwen before inactive-prior SAM3 segmentation")
-        # Seed the inactive-prior instance propagation with the ACTUAL active
-        # object mask (the door the active clip verified by motion), NOT the
-        # handle-anchored object_anchor_box — that box lands on the lower-right
-        # cabinet corner/wall, so propagating from it drifts to the wrong
-        # (neighbouring, near-identical) door. The active object mask's bbox is
-        # the real door region and gives propagation a correct instance seed.
+        # No bounding boxes anywhere: the inactive prior is seeded purely by the
+        # cross-clip text propagation below (and bare-label text inside
+        # build_inactive_label_priors), never by a box.
         active_object_prompt_box_norm = None
-        if obj_masks and object_prompt_frame_idx < len(obj_masks):
-            _aopm = np.asarray(obj_masks[object_prompt_frame_idx], dtype=bool)
-            if np.any(_aopm):
-                _aopb = mask_to_bbox(_aopm)
-                if _aopb is not None:
-                    active_object_prompt_box_norm = box_xyxy_to_normalized_xywh(_aopb, rgb_list[0].shape)
+        # Unified cross-clip object SAM3 session: seed ONCE at the active object
+        # prompt frame (where the moving part is most distinct) and propagate the
+        # instance BACKWARD through the inactive clip. The inactive portion of that
+        # single propagation becomes the object prior — so a part that is flush /
+        # closed in the inactive frames (a closed drawer is unsegmentable by a
+        # fresh bare-label seed, max_area=0) is still recovered, because SAM3 video
+        # propagation tracks the same instance back through the near-identical
+        # boundary frames. Falls back safely to the inactive-frame seed on failure.
+        # Reuse the SINGLE unified cross-clip session already run in the active
+        # block (one seed per label, propagated both ways). Its INACTIVE portion is
+        # the prior for BOTH element and object — no second SAM3 session here.
+        precomputed_inactive_object_masks = None
+        precomputed_inactive_object_metadata = None
+        precomputed_inactive_element_masks = None
+        precomputed_inactive_element_metadata = None
+        if _unified_cross_result is not None:
+            precomputed_inactive_object_masks = _unified_cross_result.get("inactive_object_masks")
+            precomputed_inactive_object_metadata = _unified_cross_result.get("inactive_object_metadata")
+            precomputed_inactive_element_masks = _unified_cross_result.get("inactive_element_masks")
+            precomputed_inactive_element_metadata = _unified_cross_result.get("inactive_element_metadata")
         inactive_elem_pts, inactive_elem_cols, inactive_obj_pts, inactive_obj_cols, _inactive_prior_metadata = build_inactive_label_priors(
             previous_inactive_clip,
             elem_label,
@@ -709,8 +813,8 @@ def process_active_clip(
             color_w,
             color_h,
             depth_cache_dir,
-            element_anchor_box_norm=box_xyxy_to_normalized_xywh(element_anchor_box, rgb_list[0].shape) if element_anchor_box is not None else None,
-            object_anchor_box_norm=box_xyxy_to_normalized_xywh(object_anchor_box, rgb_list[0].shape) if object_anchor_box is not None else None,
+            element_anchor_box_norm=None,
+            object_anchor_box_norm=None,
             object_crop_box_norm=None,
             debug_dir=clip_dir,
             sam3_predictor=sam3_predictor,
@@ -718,6 +822,11 @@ def process_active_clip(
             active_sam_rgb_list=sam_rgb_list,
             active_prompt_frame_idx=object_prompt_frame_idx,
             active_object_prompt_box_norm=active_object_prompt_box_norm,
+            precomputed_object_masks=precomputed_inactive_object_masks,
+            precomputed_object_confidence_metadata=precomputed_inactive_object_metadata,
+            precomputed_element_masks=precomputed_inactive_element_masks,
+            precomputed_element_confidence_metadata=precomputed_inactive_element_metadata,
+            precomputed_hand_masks=(_unified_cross_result.get("inactive_hand_masks") if _unified_cross_result is not None else None),
         )
     active_clip_points, active_clip_colors = stack_semantic_point_blocks(
         [final_element_pts, final_object_semantic_pts],
@@ -826,25 +935,47 @@ def process_active_clip(
         raise RuntimeError(msg)
 
     if motion_coupling["shares_rigid_motion"]:
+        element_reference_pts = np.asarray(inactive_elem_pts, dtype=np.float32)
+        element_reference_cols = np.asarray(inactive_elem_cols, dtype=np.float32)
+        if len(element_reference_pts) == 0 and prev_elem_node is not None and len(prev_elem_node.points):
+            element_reference_pts = prev_elem_node.points.copy().astype(np.float32)
+            element_reference_cols = prev_elem_node.colors.copy().astype(np.float32)
         object_reference_pts = np.asarray(inactive_obj_pts, dtype=np.float32)
         object_reference_cols = np.asarray(inactive_obj_cols, dtype=np.float32)
         if len(object_reference_pts) == 0 and prev_obj_node is not None and len(prev_obj_node.points):
             object_reference_pts = prev_obj_node.points.copy().astype(np.float32)
             object_reference_cols = prev_obj_node.colors.copy().astype(np.float32)
-        if len(object_reference_pts) == 0:
-            object_reference_pts, object_reference_cols = stack_point_blocks(
+        tracking_reference_pts, tracking_reference_cols = stack_point_blocks(
+            [pts for pts in (object_reference_pts, element_reference_pts) if len(pts)],
+            [cols for cols in (object_reference_cols, element_reference_cols) if len(cols)],
+        )
+        if len(tracking_reference_pts) == 0 and len(init_shared_motion_pts):
+            tracking_reference_pts = np.asarray(init_shared_motion_pts, dtype=np.float32)
+            tracking_reference_cols = np.asarray(init_shared_motion_cols, dtype=np.float32)
+        if len(tracking_reference_pts) == 0:
+            tracking_reference_pts, tracking_reference_cols = stack_point_blocks(
                 [pts for pts in (inactive_obj_pts, inactive_elem_pts) if len(pts)],
                 [cols for cols in (inactive_obj_cols, inactive_elem_cols) if len(cols)],
             )
         shared_prev_node = prev_obj_node if prev_obj_node is not None and len(prev_obj_node.points) else prev_elem_node
-        shared_is_articulated = shared_is_articulated_motion
-        shared_prior_points = object_reference_pts
-        shared_prior_colors = object_reference_cols
-        if shared_is_articulated:
-            print(
-                f"  using direct Artipoint articulation tracking for '{final_obj_label}' "
-                f"from {len(shared_prior_points)} prior points"
-            )
+        shared_is_articulated = is_truly_articulated_motion
+        shared_prior_points = tracking_reference_pts
+        shared_prior_colors = tracking_reference_cols
+        # Both articulated parts and rigid carries use the SAME mask-seeded
+        # CoTracker3 frontend; only the pose solver differs (joint fit vs PnP).
+        shared_pose_estimation = "articulation" if is_truly_articulated_motion else "rigid_pnp"
+        if use_active_object_sam3:
+            if shared_is_articulated:
+                print(
+                    f"  using direct Artipoint articulation tracking for shared '{elem_label}' + "
+                    f"'{final_obj_label}' motion from {len(shared_prior_points)} prior points"
+                )
+            else:
+                print(
+                    f"  using rigid 3D-3D tracking (mask-seeded CoTracker3 + depth-lifted "
+                    f"per-frame Kabsch/RANSAC, LostFound geometry, no joint fit) for shared "
+                    f"'{elem_label}' + '{final_obj_label}' motion from {len(shared_prior_points)} prior points"
+                )
 
             # Build depth-camera backprojection grid once (used by the native
             # depth lift). Reuse the same K_depth + intrinsics the prior cloud
@@ -856,40 +987,40 @@ def process_active_clip(
                     depth_raw_list[0].shape[0],
                     depth_raw_list[0].shape[1],
                 )
-            # Exclude the hand/arm from the object query masks before ArtiPoint
-            # seeds corners. tracking_obj_masks is the RAW SAM3 object mask, which
-            # routinely swallows the manipulating hand+forearm (HAND_PROMPTS cover
-            # hand/arm/person) — most severely on early frames where the hand
-            # dominates the object (observed: cabinet frame-0 object mask was
-            # ENTIRELY the hand). Seeding CoTracker on those pixels makes the
-            # articulation fit the HAND's motion instead of the door/drawer body.
-            # We subtract the dilated hand mask and keep the component nearest the
-            # interaction anchor; frames that become empty are dropped by
-            # run_artipoint_articulation_update's keyframe usability filter.
+            # Exclude the hand/arm from the shared motion query masks before
+            # ArtiPoint seeds corners. We track one combined element+object
+            # motion hypothesis, but keep the element mask separately so its own
+            # keypoints can be contributed alongside the object-body keypoints.
+            # This avoids the current failure mode where all retained tracks come
+            # from the handle alone while still exporting separate geometries.
             hand_dilate_kernel = np.ones((25, 25), dtype=np.uint8)
             artipoint_query_masks: List[np.ndarray] = []
-            for obj_mask, hand_mask in zip(tracking_obj_masks, detector_hand_masks):
-                obj_bool = np.asarray(obj_mask, dtype=bool)
+            artipoint_element_masks: List[np.ndarray] = []
+            for motion_mask, elem_mask, hand_mask in zip(shared_motion_masks, elem_masks, detector_hand_masks):
+                obj_bool = np.asarray(motion_mask, dtype=bool)
+                elem_bool = np.asarray(elem_mask, dtype=bool)
                 hand_bool = np.asarray(hand_mask, dtype=bool)
                 if np.any(hand_bool) and np.any(obj_bool):
                     hand_dilated = cv2.dilate(hand_bool.astype(np.uint8), hand_dilate_kernel, iterations=1) > 0
                     cleaned = obj_bool & ~hand_dilated
+                    cleaned_elem = elem_bool & ~hand_dilated
                     if np.any(cleaned) and primary_hand_anchor_xy is not None:
                         cleaned = keep_mask_component_nearest_point(cleaned, primary_hand_anchor_xy)
+                    if np.any(cleaned_elem) and primary_hand_anchor_xy is not None:
+                        cleaned_elem = keep_mask_component_nearest_point(cleaned_elem, primary_hand_anchor_xy)
                     artipoint_query_masks.append(np.asarray(cleaned, dtype=bool))
+                    artipoint_element_masks.append(np.asarray(cleaned_elem, dtype=bool))
                 else:
                     artipoint_query_masks.append(obj_bool.copy())
+                    artipoint_element_masks.append(elem_bool.copy())
             n_emptied = sum(
                 1
-                for before, after in zip(tracking_obj_masks, artipoint_query_masks)
+                for before, after in zip(shared_motion_masks, artipoint_query_masks)
                 if np.any(np.asarray(before, dtype=bool)) and not np.any(after)
             )
             print(
-                f"  ArtiPoint query masks: subtracted hand/arm from object masks "
+                f"  ArtiPoint query masks: subtracted hand/arm from shared element+object motion masks "
                 f"({n_emptied} frame(s) became hand-only and will be skipped)"
-            )
-            save_binary_mask_sequence(
-                clip_dir / "sam3_active_masks" / "artipoint_query", artipoint_query_masks, "object"
             )
             # Per-frame object-anchor box (handle-anchored, recomputed from EACH
             # frame's element mask) for the keypoint debug overlay — so the blue
@@ -910,26 +1041,42 @@ def process_active_clip(
                     )
                 else:
                     per_frame_object_boxes.append(None)
+            # No temporal striding/downsampling: every available active frame is
+            # tracked at full resolution (both rigid_pnp and articulated). CoTracker3
+            # memory is kept in check by SHORTENING the active clip at the launcher
+            # (earlier --frame-end) rather than dropping frames, so SAM masks and the
+            # rigid/articulated trajectory keep their full temporal density.
+            _trk_clip, _trk_rgb, _trk_depths, _trk_T_wc = clip, rgb_list, clip_depths, T_wc_list
+            _trk_query, _trk_elem, _trk_depth_raw, _trk_boxes = (
+                artipoint_query_masks, artipoint_element_masks, depth_raw_list, per_frame_object_boxes,
+            )
+            # SAM3 stays resident; online CoTracker fits alongside it, so no
+            # per-clip SAM3 teardown (which fragmented GPU memory) is needed.
             shared_lostfound, shared_lostfound_debug = run_artipoint_articulation_update(
-                clip,
+                _trk_clip,
                 final_obj_label,
                 shared_prior_points,
                 shared_prior_colors,
-                rgb_list,
-                clip_depths,
-                T_wc_list,
+                _trk_rgb,
+                _trk_depths,
+                _trk_T_wc,
                 K_color,
                 T_cam_color,
-                active_query_masks=artipoint_query_masks,
-                depth_raw_list=depth_raw_list,
+                active_query_masks=_trk_query,
+                depth_raw_list=_trk_depth_raw,
                 depth_grid=active_depth_grid,
                 K_depth=K_depth,
                 T_cam_depth=T_cam_depth,
                 D_color=D_color,
                 debug_dir=clip_dir / "tracking_debug",
-                object_prompt_boxes=per_frame_object_boxes,
+                object_prompt_boxes=_trk_boxes,
+                pose_estimation=shared_pose_estimation,
+                secondary_query_masks=_trk_elem,
+                hand_masks=detector_hand_masks,
             )
-            shared_prior_source = "artipoint_inactive_clip"
+            shared_prior_source = (
+                "artipoint_inactive_clip" if shared_is_articulated else "rigid_pnp_inactive_clip"
+            )
         else:
             shared_lostfound, shared_prior_source, shared_lostfound_debug = run_lostfound_geometry_update(
                 clip,
@@ -943,7 +1090,7 @@ def process_active_clip(
                 T_cam_color,
             )
         if shared_lostfound is None:
-            tracker_name = "Artipoint" if shared_is_articulated else "LostFound"
+            tracker_name = "Artipoint" if shared_is_articulated else ("RigidPnP" if use_active_object_sam3 else "LostFound")
             print(f"[Error] Shared-motion {tracker_name} failed for '{elem_label}' + '{final_obj_label}' in clip {clip.clip_id}; skipping active clip.")
             export_lostfound_debug_assets(
                 clip,
@@ -966,10 +1113,8 @@ def process_active_clip(
             )
             return active_clip_points, active_clip_colors
         shared_delta = np.asarray(shared_lostfound["pose_delta"], dtype=np.float32)
-        element_pts = apply_homogeneous_transform(inactive_elem_pts, shared_delta)
-        element_cols = np.asarray(inactive_elem_cols, dtype=np.float32)
-        object_reference_pts = shared_prior_points
-        object_reference_cols = shared_prior_colors
+        element_pts = apply_homogeneous_transform(element_reference_pts, shared_delta)
+        element_cols = np.asarray(element_reference_cols, dtype=np.float32)
         object_pts = apply_homogeneous_transform(object_reference_pts, shared_delta)
         object_cols = np.asarray(object_reference_cols, dtype=np.float32)
         export_tracking_debug_assets(
@@ -991,8 +1136,8 @@ def process_active_clip(
             clip,
             shared_lostfound,
             shared_prior_source,
-            inactive_elem_pts,
-            inactive_elem_cols,
+            element_reference_pts,
+            element_reference_cols,
         )
         object_motion = build_motion_record_from_tracking_reference(
             clip,
@@ -1186,7 +1331,9 @@ def process_active_clip(
                 motion_coupling=motion_coupling,
             )
 
-    semantic_only_element_geometry = bool(motion_coupling.get("shares_rigid_motion", False))
+    semantic_only_element_geometry = False
+    update_element_geometry = bool(len(np.asarray(element_pts, dtype=np.float32)))
+    record_element_motion = bool(element_motion is not None)
     element_display_centroid = (
         np.asarray(element_pts, dtype=np.float32).mean(axis=0)
         if len(element_pts)
@@ -1217,7 +1364,32 @@ def process_active_clip(
         object_motion=object_motion,
         previous_object_state=previous_object_state,
     )
-    object_state_label = str(object_state_result.get("object_state", "unknown") or "unknown")
+
+    object_state_before = str(
+        object_state_result.get("object_state_before", previous_object_state) or "unknown"
+    ).strip().lower()
+
+    object_state_after = str(
+        object_state_result.get(
+            "object_state_after",
+            object_state_result.get("object_state", "unknown"),
+        ) or "unknown"
+    ).strip().lower()
+
+    object_state_label = str(
+        object_state_result.get("object_state", object_state_after) or object_state_after or "unknown"
+    ).strip().lower()
+
+    status_changed = bool(object_state_result.get("status_changed", False))
+
+    relationship["object_state_before"] = object_state_before
+    relationship["object_state_after"] = object_state_after
+    relationship["object_state"] = object_state_label
+    relationship["status_changed"] = status_changed
+    relationship["status_change_confidence"] = float(object_state_result.get("confidence", 0.0))
+    relationship["status_change_reasoning"] = str(object_state_result.get("reasoning", ""))
+    relationship["status_video_path"] = str(object_state_result.get("active_video_path", ""))
+    relationship["status_change_raw"] = str(object_state_result.get("raw", ""))
     previous_graph = copy.deepcopy(scene_graph)
     elem_node_id, obj_node_id, edge_id = scene_graph.register_interaction(
         element_label=elem_label,
@@ -1239,13 +1411,15 @@ def process_active_clip(
         object_state_reasoning=str(object_state_result.get("reasoning", "")),
         element_desc=element_desc,
         object_desc=object_desc,
+        element_label_candidates=element_label_candidates,
+        object_label_candidates=object_label_candidates,
         voxel_size=SEM_VOXEL_SIZE,
         replace_element_geometry=True,
-        update_element_geometry=not semantic_only_element_geometry,
+        update_element_geometry=update_element_geometry,
         element_centroid_hint=element_display_centroid,
-        record_element_motion=not semantic_only_element_geometry,
+        record_element_motion=record_element_motion,
         replace_object_geometry=True,
-        element_motion=element_motion if not semantic_only_element_geometry else None,
+        element_motion=element_motion,
         object_motion=object_motion,
         create_edge=create_functional_edge,
         element_node_id=prev_elem_node.node_id if prev_elem_node is not None else None,
@@ -1281,6 +1455,8 @@ def process_active_clip(
                 "object_description": object_desc,
                 "element_captions": element_captions,
                 "object_captions": object_captions,
+                "element_label_candidates": element_label_candidates,
+                "object_label_candidates": object_label_candidates,
                 "element_view_indices": element_view_indices,
                 "object_view_indices": object_view_indices,
                 "primary_hand_anchor_xy": [round(float(primary_hand_anchor_xy[0]), 1), round(float(primary_hand_anchor_xy[1]), 1)],
@@ -1300,7 +1476,18 @@ def process_active_clip(
                 "element_node_match": prev_elem_match_debug,
                 "object_node_match": prev_obj_match_debug,
                 "previous_object_state": previous_object_state,
+
+                # graph_frank.py-compatible status-change fields
+                "object_state_before": object_state_before,
+                "object_state_after": object_state_after,
                 "object_state": object_state_label,
+                "status_changed": status_changed,
+                "status_change_confidence": round(float(relationship.get("status_change_confidence", 0.0)), 3),
+                "status_change_reasoning": relationship.get("status_change_reasoning", ""),
+                "status_video_path": relationship.get("status_video_path", ""),
+                "status_change_raw": relationship.get("status_change_raw", ""),
+
+                # backward-compatible final-state fields
                 "object_state_confidence": round(float(object_state_result.get("confidence", 0.0)), 3),
                 "object_state_reasoning": object_state_result.get("reasoning", ""),
                 "object_state_video_mode": object_state_result.get("mode", ""),
@@ -1311,7 +1498,7 @@ def process_active_clip(
                 "motion_coupling_confidence": round(float(motion_coupling.get("confidence", 0.0)), 3),
                 "motion_coupling_reasoning": motion_coupling.get("reasoning", ""),
                 "semantic_only_element_geometry": bool(semantic_only_element_geometry),
-                "rigid_tracking_parent_label": final_obj_label if semantic_only_element_geometry else None,
+                "rigid_tracking_parent_label": None,
                 "viser_motion_dir": "viser_motion",
                 "element_geometry_update": summarize_lostfound_result(element_lostfound, element_prior_source),
                 "object_geometry_update": summarize_lostfound_result(object_lostfound, object_prior_source),
@@ -1409,9 +1596,9 @@ def run_pipeline(config: PipelineConfig) -> None:
         f"SAM text prompt style: {'simple (bare label)' if config.sam_backend == 'sam3' else 'elaborate (interaction-aware)'}"
     )
     print(f"Building shared {config.sam_backend.upper()} video predictor for the whole pipeline...")
-    sam3_predictor = build_configured_sam3_video_predictor(config)
-    # Register so Qwen load/release can move it off/on GPU (memory sharing on 16GB GPUs).
-    _set_shared_sam3_predictor(sam3_predictor)
+    sam3_manager = Sam3Manager(config)
+    # SAM3 is built lazily by the manager and RELEASED before each clip's CoTracker
+    # pass, so SAM3 and CoTracker never co-reside on the GPU (fixes long-clip OOM).
 
     for clip in clips:
         depth_raw_list: List[np.ndarray] = []
@@ -1442,7 +1629,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 rgb_list=rgb_list if clip_depths is not None else None,
                 T_wc_list=T_wc_list if clip_depths is not None else None,
                 inactive_stride=config.inactive_stride,
-                sam3_predictor=sam3_predictor,
+                sam3_manager=sam3_manager,
             )
             previous_inactive_clip = clip
         else:
@@ -1488,7 +1675,7 @@ def run_pipeline(config: PipelineConfig) -> None:
                 previous_inactive_clip,
                 depth_cache_dir,
                 config,
-                sam3_predictor=sam3_predictor,
+                sam3_manager=sam3_manager,
             )
 
         scene_points, scene_colors = build_scene_snapshot(global_pcd_pts, global_pcd_cols, scene_graph, scene_suppression_boxes)
@@ -1524,10 +1711,9 @@ def run_pipeline(config: PipelineConfig) -> None:
         torch.cuda.empty_cache()
         gc.collect()
 
-    print("Shutting down shared SAM3 video predictor...")
-    _set_shared_sam3_predictor(None)
-    sam3_predictor.shutdown()
-    del sam3_predictor
+    print("Shutting down SAM3 video predictor...")
+    sam3_manager.shutdown()
+    del sam3_manager
     torch.cuda.empty_cache()
     gc.collect()
 

@@ -67,7 +67,6 @@ from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoProcessor,
-    BitsAndBytesConfig,
     Qwen3VLForConditionalGeneration,
 )
 
@@ -96,6 +95,13 @@ DEFAULT_SAM3I_PACKAGE_ROOT = PROJECT_ROOT / "SAM3-I" / "sam3"
 DEFAULT_SAM3I_CHECKPOINT_PATH = PROJECT_ROOT / "SAM3-I" / "checkpoint.pt"
 SAM3_BPE_RELATIVE_PATH = Path("sam3") / "assets" / "bpe_simple_vocab_16e6.txt.gz"
 _SAM_BACKEND_IMPORT_CACHE: Dict[Tuple[str, str], Tuple[Path, Any]] = {}
+_ACTIVE_PIPELINE_SAM_CONFIG: Optional["PipelineConfig"] = None
+
+
+def set_active_pipeline_sam_config(config: Optional["PipelineConfig"]) -> None:
+    """Expose the current pipeline SAM config to lazy helper-side predictor builds."""
+    global _ACTIVE_PIPELINE_SAM_CONFIG
+    _ACTIVE_PIPELINE_SAM_CONFIG = config
 
 
 def _normalize_sam_backend_name(name: object) -> str:
@@ -139,6 +145,8 @@ def _import_sam_backend_builder(backend: str, package_root: Path):
 
 
 def build_configured_sam3_video_predictor(config: Optional["PipelineConfig"] = None):
+    if config is None:
+        config = _ACTIVE_PIPELINE_SAM_CONFIG
     backend = _normalize_sam_backend_name(getattr(config, "sam_backend", DEFAULT_SAM_BACKEND))
     sam3i_package_root = getattr(config, "sam3i_package_root", DEFAULT_SAM3I_PACKAGE_ROOT)
     package_root = _sam_backend_package_root(backend, sam3i_package_root)
@@ -169,66 +177,7 @@ def build_configured_sam3_video_predictor(config: Optional["PipelineConfig"] = N
     return builder(**kwargs)
 
 
-# The SAM3/SAM3-I video predictor is built once and kept resident for the whole
-# pipeline. SAM3-I's footprint is large; to avoid starving Qwen-VL on a single
-# 16GB GPU we move the predictor's weights off-GPU whenever Qwen is loaded and
-# back on-GPU when Qwen is released (the pipeline never runs SAM3 and Qwen at the
-# same time). These helpers centralize that toggle.
-_SHARED_SAM3_PREDICTOR = None
-
-
-def _set_shared_sam3_predictor(predictor) -> None:
-    """Register the resident SAM3 predictor so Qwen load/release can free its GPU memory."""
-    global _SHARED_SAM3_PREDICTOR
-    _SHARED_SAM3_PREDICTOR = predictor
-
-
-def _move_shared_sam3_predictor(device: str) -> None:
-    """Move the resident SAM3 predictor on/off GPU, aggressively reclaiming GPU memory.
-
-    When moving to CPU we also drop any cached per-session inference states the
-    predictor holds (they pin GPU tensors), then force GC + empty_cache so Qwen
-    sees the maximum possible free GPU memory and stays out of the CPU-offload
-    regime that hangs the active-video generation.
-
-    DEBUG / KNOWN LIMITATION (2026-06-09): this "option B" off-loads SAM3-I to the
-    HOST during Qwen, but the SLURM job is capped at 24G RAM (the requested 96G is
-    silently ignored by this cluster, same as --nodelist/--exclude). SAM3-I (~8GB)
-    on CPU + Qwen's 16GB CPU load footprint exceeds 24G -> host OOM-kill. So this
-    path cannot fully solve the contention here; prefer 4-bit Qwen (no offload,
-    SAM3-I can stay GPU-resident). Kept because it still helps for sam3 (small) and
-    documents the approach. See load_qwen_bundle's tuning notes.
-    """
-    predictor = _SHARED_SAM3_PREDICTOR
-    if predictor is None:
-        return
-    model = getattr(predictor, "model", None)
-    if model is not None and hasattr(model, "to"):
-        try:
-            model.to(device)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[Warn] could not move SAM3 predictor to {device}: {exc}")
-    if device == "cpu":
-        # Sessions/inference states pin GPU tensors; clear them so the GPU frees up.
-        # They are only created inside a run_sam3 call (which closes them), so at
-        # Qwen time there is nothing live to lose.
-        for holder in (predictor, type(predictor)):
-            states = getattr(holder, "_ALL_INFERENCE_STATES", None)
-            if isinstance(states, dict):
-                states.clear()
-        for attr in ("feature_cache", "_feature_cache"):
-            cache = getattr(predictor, attr, None)
-            if isinstance(cache, dict):
-                cache.clear()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:  # noqa: BLE001
-            pass
-
-
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -243,9 +192,20 @@ HAND_PROMPTS = ["human hand", "human arm", "person"]
 MIN_CLIP_FRAMES = 5
 DETECTION_THRESH = 0.5
 FULL_FRAME_QWEN_SIZE = (960, 540)
+QWEN_IMAGE_MAX_PIXELS = 360_448
+QWEN_VIDEO_MAX_PIXELS = 301_056
 QWEN_ACTIVE_VIDEO_FRAME_STRIDE = 5
 QWEN_ACTIVE_VIDEO_FPS = 5
-QWEN_ACTIVE_VIDEO_MAX_FRAMES = 48
+# Cap on frames in the Qwen active-clip detection video. Reverted to 48 now that
+# SAM3 is built once and kept resident (no per-clip rebuild fragmentation), so the
+# Qwen baseline no longer creeps up and the detection forward has its old headroom.
+# Env-tunable if a pathologically long clip ever needs trimming.
+QWEN_ACTIVE_VIDEO_MAX_FRAMES = int(os.environ.get("QWEN_ACTIVE_VIDEO_MAX_FRAMES", "48"))
+# Ablation: whether to show Qwen the inactive "before" context frames in detection
+# (the rest-state images that help it tell the moving PART from its static parent,
+# e.g. "cabinet door" vs "cabinet"). Set 0 to run the no-context ablation arm:
+# Qwen then sees ONLY the active interaction frames.
+QWEN_CONTEXT_FRAMES = os.environ.get("QWEN_CONTEXT_FRAMES", "1") == "1"
 SAM3_MAX_IMAGE_SIDE = int(os.environ.get("SAM3_MAX_SIDE", "0"))
 # When False (default), the debug-image writers — binary mask PNG sequences,
 # SAM3 overlay PNGs, LostFound failure overlays — are no-ops. Set GRAPH_DEBUG_IMAGES=1
@@ -261,6 +221,20 @@ CAPTION_MAX_VIEWS = 4
 LOOKAHEAD_FRAMES = 16
 HAND_HISTORY_SIZE = 10
 HAND_DISTANCE_THRESHOLD = 0.10
+# Require at least modest wrist travel before a contact/near-object frame can
+# start an active interaction. Filters prolonged static hand-resting on a
+# handle/counter while still allowing real manipulations to trigger once the
+# wrist actually begins moving.
+INTERACTION_WRIST_TRAVEL_THRESHOLD = 0.025
+# Activation must sit inside a SUSTAINED contact run, not a spurious isolated
+# 1-frame touch. Without this, a single stray contact frame whose 16-frame
+# lookahead happens to see the later real grasp (e.g. cabinet frame 289, isolated,
+# with sustained contact only from 301) latches the state machine on far too early
+# and swallows the whole inactive prefix (0 inactive clips -> no inactive prior).
+# Require a majority of the immediate next IMMEDIATE_CONTACT_LOOKAHEAD frames to
+# also be in contact before activating.
+IMMEDIATE_CONTACT_LOOKAHEAD = 4
+IMMEDIATE_CONTACT_MIN = 2
 HAND_VELOCITY_DIFF_THRESHOLD = 0.025
 LOSTFOUND_HAND_DISTANCE_THRESHOLD = 0.25
 # Activation distance for LostFound pose tracking. Tighter than the global
@@ -281,14 +255,30 @@ LOSTFOUND_ACTIVATION_DISTANCE = 0.20
 LOSTFOUND_BASE_THRESHOLD = 3
 LOSTFOUND_HIGH_THRESHOLD_BONUS = 2
 SMOOTH_FALLBACK_RADIUS = 3
-ACTIVE_CLIP_PREROLL_FRAMES = 5
+# Hybrid active-onset rule inspired by LostFound plus our articulated-mask needs:
+# start either at motion-gated closest-approach OR after a sustained grasp dwell
+# on the object. The dwell fallback rescues cabinet-like clips where the hand is
+# already stably grasping the handle before visible motion begins.
+ACTIVE_CLIP_GRASP_DWELL_MIN = 5
+# Keep a small lead-in once activation fires, but shorter than before so drawer
+# does not regain a long static pre-motion prefix.
+ACTIVE_CLIP_PREROLL_FRAMES = 0
 # Forward-extend the active clip past the last strict contact trigger while the
 # hand stream is still present. Covers the tail of an interaction where the RCNN
 # hand/object detector drops out (hand grips a handle near the image edge and
 # stops being detected) but the manipulation is still ongoing — e.g. the 183
 # drawer, which keeps sliding fully open across ~15 frames that were wrongly
 # marked inactive (hand_ratio 0.067). Stops at clip/pose-block boundaries.
-ACTIVE_CLIP_POSTROLL_FRAMES = 16
+ACTIVE_CLIP_POSTROLL_FRAMES = int(os.environ.get("ACTIVE_CLIP_POSTROLL_FRAMES", "0"))
+# Bridge SHORT contact dropouts inside a single continuous interaction. When the
+# hand+object briefly leave detection mid-manipulation (e.g. the carried bowl is
+# occluded for ~13 frames before reappearing in the same carry), the active flag
+# goes False for that hole and the clip is wrongly split in two. Fill False-holes
+# up to this many frames that are flanked by active frames on BOTH sides, so the
+# carry stays ONE clip. Kept below a real inter-interaction gap (the 183 bowl has
+# a 13-frame dropout to bridge and a 30-frame true gap to preserve). Stops at
+# clip/pose-block boundaries (never bridges across a frame/pose discontinuity).
+ACTIVE_CLIP_BRIDGE_GAP_FRAMES = int(os.environ.get("ACTIVE_CLIP_BRIDGE_GAP_FRAMES", "15"))
 # When deriving the active object SAM3 box from the interactive-element (handle)
 # mask, expand the element bbox by this factor (about its center) so the box
 # covers the part of the moving body around the handle without spilling onto the
@@ -329,12 +319,68 @@ LOSTFOUND_MIN_UPDATES = 2
 # 0.80.
 LOSTFOUND_POSE_MIN_VISIBLE_POINTS = 32
 LOSTFOUND_ROTATION_SLERP_ALPHA = 0.4
+# Rigid-transport (LostFound) PnP rotation floor: minimum number of VISIBLE tracked
+# corners needed to solve PnP for this frame's rotation. LostFound solves PnP on
+# whatever points are visible (no hard floor), so a low value keeps a fresh rotation
+# almost every frame; carry-forward only fills the rare fully-occluded frame.
+RIGID_PNP_MIN_VISIBLE_POINTS = int(os.environ.get("RIGID_PNP_MIN_VISIBLE_POINTS", "6"))
+# Re-seed corners on EVERY active frame for the rigid-transport path too (not just
+# the first), mirroring the articulated path. The single-seed PnP model froze the
+# rotation once the frame-0 corners died (e.g. the carried bowl rotated/occluded
+# and no new points were ever added -> orientation stuck at ~4 deg while the hand
+# kept translating it). With re-seeding, rotation is driven by INCREMENTAL
+# consecutive-frame Kabsch on the world-lifted tracks (robust to corner turnover),
+# while translation stays hand-anchored. Set 0 to restore single-seed PnP.
+RIGID_RESEED_EVERY_FRAME = os.environ.get("RIGID_RESEED_EVERY_FRAME", "1") == "1"
+# Minimum corner pairs shared by two consecutive frames to accept an incremental
+# Kabsch rotation step; below this the rotation is carried forward one frame.
+RIGID_KABSCH_MIN_PAIRS = int(os.environ.get("RIGID_KABSCH_MIN_PAIRS", "6"))
 ARTIPOINT_TRACK_MAX_POINTS = 256
 # Active object-mask corner tracking for articulated parts:
-# every active frame can contribute up to 30 Shi-Tomasi corners from the
-# SAM3 object mask, with a global cap before CoTracker3 launch.
-ARTIPOINT_MAX_CORNERS_PER_KEYFRAME = 30
-ARTIPOINT_MAX_TOTAL_QUERIES = 1500
+# every active frame can contribute up to this many Shi-Tomasi corners from the
+# SAM3 object mask, with a global cap before CoTracker3 launch. Raised from 30 to 80
+# for denser tracking — small/occluded objects like the drawer otherwise yield too
+# few keypoints (sparse, jumpy tracks).
+ARTIPOINT_MAX_CORNERS_PER_KEYFRAME = 80
+ARTIPOINT_MAX_TOTAL_QUERIES = 2500
+# Pixels to dilate the per-frame hand mask before subtracting it from the
+# object/handle corner-seeding masks. ArtiPoint must track the moving PART only,
+# never the gripping hand (textured skin attracts goodFeaturesToTrack off the
+# textureless door). A few-pixel buffer also removes corners on the hand/part
+# boundary, which otherwise jitter between hand and part.
+ARTIPOINT_HAND_EXCLUSION_DILATE = int(os.environ.get("ARTIPOINT_HAND_EXCLUSION_DILATE", "15"))
+# Use ArtiPoint's motion-bisector pivot for the revolute hinge point
+# (point_bisector_free_traj = _estimate_motion_point_bisectors), rather than
+# picking whichever pivot candidate minimises translation RMSE. This matches the
+# ArtiPoint frontend (perpendicular bisectors of the per-frame motion translations
+# intersect at the rotation centre). Falls back to the RMSE-best candidate if the
+# bisector pivot is unavailable. Env-tunable.
+ARTIPOINT_PREFER_BISECTOR_PIVOT = os.environ.get("ARTIPOINT_PREFER_BISECTOR_PIVOT", "1") == "1"
+# CoTracker3 offline processes the WHOLE active clip in one forward pass, so a
+# long high-res clip (e.g. 151 frames @ 1920x1080 = 313 MPix) OOMs the 16 GB GPU
+# on activations (observed: spoon clip, tried to alloc 2.88 GiB with 2.27 free).
+# Cap the total tracked pixel volume (frames x H x W of the SCALED video). Above
+# this we downscale the video isotropically for tracking only and rescale the 2D
+# tracks back to full resolution before lifting/PnP (K_color stays full-res).
+# Short clips stay native. Tune via env for tighter/looser GPU budgets.
+ARTIPOINT_COTRACKER_MAX_TRACK_PIXELS = int(
+    os.environ.get("ARTIPOINT_COTRACKER_MAX_TRACK_PIXELS", str(45_000_000))
+)
+# For the rigid_pnp path (free carried objects), a long high-res active clip OOMs
+# CoTracker3 offline. Instead of downscaling (which the user disabled), we keep
+# FULL resolution and temporally STRIDE the clip for tracking — PnP is per-frame,
+# so a rigid 6-DoF pose just gets fewer (still dense enough) samples. The stride is
+# the LARGEST stride that still leaves AT LEAST this many frames, so CoTracker
+# always has enough frames to track reliably. Articulated clips are untouched.
+RIGID_PNP_TRACK_MIN_FRAMES = int(os.environ.get("RIGID_PNP_TRACK_MIN_FRAMES", "50"))
+# The inactive prior is built by propagating the single active seed BACKWARD
+# through the inactive frames. On frames far from the seed (earliest inactive),
+# propagation can drift onto a neighbouring near-identical instance (e.g. BOTH
+# cabinet doors), ballooning the object mask. Walking back from the boundary
+# (frame nearest the active seed), the first frame whose object-mask area exceeds
+# this ratio of the boundary-frame area is treated as the drift point: that frame
+# and ALL earlier ones are dropped from the prior. Set <=0 to disable.
+INACTIVE_PRIOR_DRIFT_AREA_RATIO = float(os.environ.get("INACTIVE_PRIOR_DRIFT_AREA_RATIO", "1.8"))
 # Minimum inactive-prior points required to ENTER the direct ArtiPoint path.
 # This only gates entry — the actual CoTracker queries are seeded from the
 # ACTIVE object-mask Shi-Tomasi corners (hundreds per clip), so a sparse
@@ -383,11 +429,36 @@ ARTIPOINT_TRACK_SMOOTH_LAMBDA_JERK = 5.0
 ARTIPOINT_TRACK_RELIABILITY_MIN = 0.5
 ARTIPOINT_STATIC_TRACK_MIN_MOTION_M = 0.025
 ARTIPOINT_SURFACE_TRACK_MAX_QUERY_PRIOR_DISTANCE_M = 0.06
-ARTIPOINT_MIN_FILTERED_TRACKS = 32
+# Lowered 32 -> 16: small/occluded objects (e.g. the drawer) survive segmentation with
+# fewer usable frames; 32 was dropping them to zero output. 16 still needs a real cluster
+# of tracks for a usable articulation fit, just less aggressively.
+ARTIPOINT_MIN_FILTERED_TRACKS = 16
 ARTIPOINT_FILTER_SMOOTHNESS_THRESHOLD = 0.2
 ARTIPOINT_FILTER_VARIANCE_TYPE = "2d"
 ARTIPOINT_FILTER_PERCENTILE = 80
 ARTIPOINT_FILTER_OCCLUSION_THRESHOLD = 0.5
+# Seed-relative occlusion filter: minimum lifetime (first->last visible frame)
+# span a re-seeded track must cover before its visibility fraction is trusted.
+# Guards against 1-2 frame blips passing at frac=1.0 once we score tracks over
+# their own lifetime instead of the whole clip.
+ARTIPOINT_FILTER_OCCLUSION_MIN_LIFETIME_FRAMES = int(
+    os.environ.get("ARTIPOINT_FILTER_OCCLUSION_MIN_LIFETIME_FRAMES", "8")
+)
+# ArtiPoint-literal filtering: ArtiPoint's articulated frontend is ONLY
+# non_smooth -> median -> occluded -> outlier -> smooth, then the factor-graph
+# fit. We had added two non-ArtiPoint filters (an absolute static-motion floor
+# and a prior-surface proximity gate) that together stripped ~half the tracks
+# (e.g. 1869 -> 790 -> ... -> 35 on the cabinet door). With this flag set the
+# articulated path drops BOTH extras and runs ArtiPoint's chain verbatim.
+ARTIPOINT_LITERAL_FILTERS = os.environ.get("ARTIPOINT_LITERAL_FILTERS", "1") == "1"
+# Occlusion-filter mode. ArtiPoint's literal filter scores visibility over the
+# WHOLE clip (correct for its OFFLINE single-seed tracking). Online causal
+# tracking + mask re-seeding needs either "seed_relative" (score each track over
+# its own lifetime) or "off" (ArtiPoint gates this via filter_unreliable_tracks).
+#   "whole_clip"    -> ArtiPoint literal (offline-faithful; kills online re-seeds)
+#   "seed_relative" -> online analog (keeps re-seeds that track cleanly)
+#   "off"           -> disable (ArtiPoint filter_unreliable_tracks: false)
+ARTIPOINT_OCCLUSION_FILTER_MODE = os.environ.get("ARTIPOINT_OCCLUSION_FILTER_MODE", "off")
 ARTIPOINT_FILTER_DBSCAN_EPS = 0.1
 ARTIPOINT_FILTER_DBSCAN_MIN_SAMPLES = 5
 COTRACKER3_CHECKPOINT_DIR = Path(
@@ -420,6 +491,13 @@ SAM3_BOOTSTRAP_BOX_MARGIN = 0.08
 SAM3_BOOTSTRAP_BOX_MIN_PIXELS = 64
 SAM3_CONFIDENCE_MIN = 0.35
 SAM3_CONFIDENCE_MIN_VALID_FRAMES = 1
+# Hard gate on SAM3's OWN per-frame probability (out_probs). When SAM3 reports a
+# score below this, the mask for that frame is dropped (left empty) at the source,
+# so a frame where the prompted object is absent/occluded yields an EMPTY mask
+# instead of "random stuff" that then contaminates keypoints/stabilization. An
+# empty frame is fine — downstream confidence/visibility handles gaps. Set to 0 to
+# disable. Frames where SAM3 returns no score (NaN) are kept (legacy behavior).
+SAM3_RAW_SCORE_MIN = float(os.environ.get("SAM3_RAW_SCORE_MIN", "0.5"))
 SAM3_AREA_OUTLIER_RATIO = 3.0
 SAM3_BOX_CENTER_OUTLIER_RATIO = 0.35
 
@@ -620,7 +698,10 @@ class PipelineConfig:
     # frames lifted (which previously starved 307_2200's container prior
     # down to 16 world points).
     inactive_stride: int = 5
-    inactive_prior_frames: int = 4
+    # Use the LAST N inactive frames (nearest the active interaction) to build the
+    # prior, instead of all of them — the frames closest to the grasp are the most
+    # representative rest-state view of the object.
+    inactive_prior_frames: int = 10
     frame_start: int = 0
     frame_end: int = 370
     static_tf_path: Optional[Path] = None
@@ -820,5 +901,3 @@ MOVABLE_ATTACHMENT_LABELS = (
     "pull",
     "lever",
 )
-
-

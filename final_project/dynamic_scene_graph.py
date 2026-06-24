@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-# import open3d as o3d
+import open3d as o3d
 from scipy.spatial import KDTree
 
 
@@ -24,6 +24,9 @@ NODE_MATCH_MAX_CENTROID_DISTANCE_M = 0.35
 NODE_MATCH_OVERLAP_RADIUS_M = 0.08
 NODE_MATCH_MIN_OVERLAP_RATIO = 0.12
 NODE_MATCH_MAX_MEDIAN_NN_DISTANCE_M = 0.10
+# Voxel size for deduping the unified (multi-interaction) motion cloud, where the
+# same surface segmented in different clips is chained back to a common config.
+UNIFIED_MOTION_VOXEL_SIZE = 0.02
 
 _LABEL_TOKEN_ALIASES = {
     "refrigerator": "fridge",
@@ -342,6 +345,8 @@ class GraphNode:
     pointcloud_file: str = ""
     state_history: List[dict] = field(default_factory=list)
     motion_segments: List[NodeMotionSegment] = field(default_factory=list)
+    # Qwen-proposed ranked alternative labels (top-K) for recall@K evaluation.
+    label_candidates: List[str] = field(default_factory=list)
 
     def update_state(self, new_state: str, clip_id: int, reasoning: str = "") -> None:
         """Record a state transition on the node."""
@@ -432,6 +437,7 @@ class GraphNode:
             "pointcloud_file": self.pointcloud_file,
             "state_history": self.state_history,
             "motion_segments": [segment.to_dict() for segment in self.motion_segments],
+            "label_candidates": list(self.label_candidates),
         }
 
     @classmethod
@@ -455,6 +461,7 @@ class GraphNode:
             pointcloud_file=payload.get("pointcloud_file", ""),
             state_history=payload.get("state_history", []),
             motion_segments=[NodeMotionSegment.from_dict(item) for item in payload.get("motion_segments", [])],
+            label_candidates=list(payload.get("label_candidates", []) or []),
         )
 
 
@@ -817,25 +824,131 @@ class DynamicSceneGraph:
         """Return incoming edges to a node."""
         return [edge for edge in self.edges.values() if edge.dst_id == node_id]
 
+    def _unified_motion(
+        self, node: "GraphNode"
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, List[Tuple["NodeMotionSegment", np.ndarray]]]]:
+        """Build ONE canonical cloud for a node + the chained start-transform per segment.
+
+        When the same object is manipulated across several clips (e.g. a cabinet
+        opened in clip 1 and closed in clip 5), each segment owns its own reference
+        cloud at its own rest config. To animate a SINGLE shared cloud whose
+        configuration is chained over the whole video, we:
+
+          - sort the segments in time;
+          - accumulate ``A_k`` = the body's config at the START of segment k,
+            relative to the canonical (segment-1) rest. By continuity the body is
+            left where the previous interaction ended, so
+            ``A_k = delta_{k-1}(end) @ A_{k-1}`` with ``A_1 = I`` and
+            ``delta(f) = pose(f) @ inv(reference_pose)``;
+          - bring every segment's reference cloud back to canonical (``A_k^{-1}``)
+            and UNION them (voxel-deduped) into one cloud ``P_U``.
+
+        Rendering segment k at frame f then transforms ``P_U`` by
+        ``delta_k(f) @ A_k`` — so the one cloud opens during clip 1, holds open,
+        then closes during clip 5. A single-segment node yields ``A_1 = I`` and
+        ``P_U`` = its own reference cloud, i.e. identical to the legacy path.
+        Cached on the node and invalidated when the segment signature changes.
+        """
+        segments = sorted(
+            node.motion_segments,
+            key=lambda s: (int(s.frame_start), int(s.clip_id), str(s.segment_id)),
+        )
+        if not segments:
+            return None
+        signature = tuple(
+            (str(s.segment_id), len(s.pose_history), int(len(s.reference_points)))
+            for s in segments
+        )
+        cached = getattr(node, "_unified_cache", None)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+        A = np.eye(4, dtype=np.float64)
+        seg_transforms: List[Tuple["NodeMotionSegment", np.ndarray]] = []
+        union_pts: List[np.ndarray] = []
+        union_cols: List[np.ndarray] = []
+        for seg in segments:
+            seg_transforms.append((seg, A.copy()))
+            ref_pts = np.asarray(seg.reference_points, dtype=np.float32)
+            if len(ref_pts):
+                canonical_pts = _apply_homogeneous_transform(
+                    ref_pts, np.linalg.inv(A).astype(np.float32)
+                )
+                union_pts.append(np.asarray(canonical_pts, dtype=np.float32))
+                cols = np.asarray(seg.reference_colors, dtype=np.float32)
+                if len(cols) != len(canonical_pts):
+                    cols = np.full((len(canonical_pts), 3), 0.5, dtype=np.float32)
+                union_cols.append(cols)
+            # Chain: advance A by this segment's end delta for the NEXT segment.
+            end_pose = seg.get_pose_at_frame(int(seg.frame_end), exact=False)
+            if end_pose is not None:
+                ref_pose = _as_pose_matrix(seg.reference_pose).astype(np.float64)
+                try:
+                    delta_end = np.asarray(end_pose, dtype=np.float64) @ np.linalg.inv(ref_pose)
+                    A = delta_end @ A
+                except np.linalg.LinAlgError:
+                    pass
+
+        if not union_pts:
+            result = None
+        else:
+            points = np.concatenate(union_pts, axis=0).astype(np.float32)
+            colors = np.concatenate(union_cols, axis=0).astype(np.float32)
+            # Voxel-dedup the union: chained-back clouds from different clips that
+            # describe the same surface collapse onto each other instead of doubling.
+            if len(points):
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points)
+                pcd.colors = o3d.utility.Vector3dVector(colors)
+                pcd = pcd.voxel_down_sample(UNIFIED_MOTION_VOXEL_SIZE)
+                points = np.asarray(pcd.points, dtype=np.float32)
+                colors = np.asarray(pcd.colors, dtype=np.float32) if pcd.has_colors() else colors
+            result = (points, colors, seg_transforms)
+
+        try:
+            node._unified_cache = (signature, result)
+        except Exception:  # noqa: BLE001 - dataclass without slots; best-effort cache
+            pass
+        return result
+
     def get_node_geometry_at_frame(
         self,
         node_id: str,
         frame: int,
         exact: bool = True,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Render one node's geometry at a requested frame from stored motion history."""
+        """Render one node's geometry at a requested frame from stored motion history.
+
+        All of a node's interactions animate ONE shared, configuration-chained
+        cloud (see ``_unified_motion``): the most recent segment with a pose at
+        ``frame`` wins, so when frames fall between interactions the cloud holds
+        the config the last interaction left it in.
+        """
         node = self.nodes.get(node_id)
         if node is None:
             return None
-        candidates: List[Tuple[NodeMotionSegment, np.ndarray]] = []
-        for segment in node.motion_segments:
+        unified = self._unified_motion(node)
+        if unified is None:
+            return None
+        union_points, union_colors, seg_transforms = unified
+        chosen: Optional[Tuple[NodeMotionSegment, np.ndarray, np.ndarray]] = None
+        for segment, start_transform in seg_transforms:
             pose = segment.get_pose_at_frame(frame, exact=exact)
             if pose is not None:
-                candidates.append((segment, pose))
-        if not candidates:
+                # Later segments (sorted by frame_start) overwrite earlier ones, so
+                # the most recent interaction's configuration wins at this frame.
+                chosen = (segment, start_transform, pose)
+        if chosen is None:
             return None
-        segment, _pose = max(candidates, key=lambda item: (int(item[0].clip_id), int(item[0].frame_end)))
-        return segment.render_geometry_at_frame(frame, exact=exact)
+        segment, start_transform, pose = chosen
+        ref_pose = _as_pose_matrix(segment.reference_pose).astype(np.float64)
+        try:
+            delta = np.asarray(pose, dtype=np.float64) @ np.linalg.inv(ref_pose)
+        except np.linalg.LinAlgError:
+            return None
+        phi = (delta @ start_transform.astype(np.float64)).astype(np.float32)
+        points = _apply_homogeneous_transform(union_points, phi)
+        return points, union_colors
 
     def get_node_geometry_by_label_at_frame(
         self,
@@ -920,6 +1033,8 @@ class DynamicSceneGraph:
         object_state_reasoning: str = "",
         element_desc: str = "",
         object_desc: str = "",
+        element_label_candidates: Optional[Sequence[str]] = None,
+        object_label_candidates: Optional[Sequence[str]] = None,
         voxel_size: float = 0.02,
         replace_element_geometry: bool = False,
         update_element_geometry: bool = True,
@@ -983,6 +1098,8 @@ class DynamicSceneGraph:
             self.nodes[elem_id].frame_end = frame_end
             if element_state != "unknown":
                 self.update_node_state(elem_id, element_state, clip_id, element_state_reasoning or cot_reasoning)
+        if element_label_candidates:
+            self.nodes[elem_id].label_candidates = [str(c).strip() for c in element_label_candidates if str(c).strip()]
         if element_motion and record_element_motion:
             self.record_node_motion(
                 elem_id,
@@ -1038,6 +1155,8 @@ class DynamicSceneGraph:
             self.nodes[obj_id].frame_end = frame_end
             if object_state != "unknown":
                 self.update_node_state(obj_id, object_state, clip_id, object_state_reasoning or cot_reasoning)
+        if object_label_candidates:
+            self.nodes[obj_id].label_candidates = [str(c).strip() for c in object_label_candidates if str(c).strip()]
         if object_motion:
             self.record_node_motion(
                 obj_id,
@@ -1116,8 +1235,33 @@ class DynamicSceneGraph:
                         pcd.colors = o3d.utility.Vector3dVector(segment.reference_colors)
                     o3d.io.write_point_cloud(str(root / segment.reference_pointcloud_file), pcd)
 
+        node_payload: Dict[str, dict] = {}
+        for node_id, node in self.nodes.items():
+            nd = node.to_dict()
+            # Per-frame GLOBAL centroid trajectory: the exact world position viser
+            # renders (get_node_geometry_at_frame), so the centroid can be diffed
+            # against GT motion_origin_pos at the annotated frames.
+            trajectory: Dict[str, list] = {}
+            frame_to_pos: Dict[int, list] = {}
+            for frame in self.get_exact_motion_frames(node_id):
+                geom = self.get_node_geometry_at_frame(node_id, int(frame), exact=True)
+                if geom is not None and len(geom[0]):
+                    pos = [round(float(v), 5) for v in geom[0].mean(axis=0)]
+                    trajectory[str(int(frame))] = pos
+                    frame_to_pos[int(frame)] = pos
+            if trajectory:
+                nd["global_trajectory"] = trajectory
+            # Stamp the clean GLOBAL world position onto each pose sample (the
+            # rendered centroid viser shows), so consumers reading pose_history get
+            # the true position instead of the delta pose[:3,3] artifact.
+            for seg_dict in nd.get("motion_segments", []) or []:
+                for sample in seg_dict.get("pose_history", []) or []:
+                    pos = frame_to_pos.get(int(sample.get("frame", -1)))
+                    if pos is not None:
+                        sample["global_position"] = pos
+            node_payload[node_id] = nd
         payload = {
-            "nodes": {node_id: node.to_dict() for node_id, node in self.nodes.items()},
+            "nodes": node_payload,
             "edges": {edge_id: edge.to_dict() for edge_id, edge in self.edges.items()},
         }
         with open(root / "graph.json", "w", encoding="utf-8") as handle:

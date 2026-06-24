@@ -1322,13 +1322,17 @@ def fit_articulation_model_joint_optimization(
                             _register_native_pivot_candidate("point_track_cluster", cluster.get("pivot"))
 
                         if pivot_candidate_scores:
-                            chosen_pivot_source = min(
-                                pivot_candidate_scores,
-                                key=lambda name: (
-                                    float(pivot_candidate_scores[name].get("translation_rmse_m", float("inf"))),
-                                    int(candidate_priority_idx.get(name, len(candidate_priority))),
-                                ),
-                            )
+                            if ARTIPOINT_PREFER_BISECTOR_PIVOT and "point_bisector_free_traj" in pivot_candidate_scores:
+                                # ArtiPoint's hinge = motion-bisector intersection.
+                                chosen_pivot_source = "point_bisector_free_traj"
+                            else:
+                                chosen_pivot_source = min(
+                                    pivot_candidate_scores,
+                                    key=lambda name: (
+                                        float(pivot_candidate_scores[name].get("translation_rmse_m", float("inf"))),
+                                        int(candidate_priority_idx.get(name, len(candidate_priority))),
+                                    ),
+                                )
                             native["axis_point"] = np.asarray(pivot_candidates[chosen_pivot_source], dtype=np.float32).tolist()
                             articulation_axis_candidates = _build_articulation_axis_candidates(
                                 axis_native,
@@ -1783,13 +1787,17 @@ def fit_articulation_model_joint_optimization(
                 _register_pivot_candidate("point_track_cluster", cluster.get("pivot"))
 
         if pivot_candidate_scores:
-            chosen_pivot_source = min(
-                pivot_candidate_scores,
-                key=lambda name: (
-                    float(pivot_candidate_scores[name].get("translation_rmse_m", float("inf"))),
-                    int(candidate_priority_idx.get(name, len(candidate_priority))),
-                ),
-            )
+            if ARTIPOINT_PREFER_BISECTOR_PIVOT and "point_bisector_free_traj" in pivot_candidate_scores:
+                # ArtiPoint's hinge = motion-bisector intersection.
+                chosen_pivot_source = "point_bisector_free_traj"
+            else:
+                chosen_pivot_source = min(
+                    pivot_candidate_scores,
+                    key=lambda name: (
+                        float(pivot_candidate_scores[name].get("translation_rmse_m", float("inf"))),
+                        int(candidate_priority_idx.get(name, len(candidate_priority))),
+                    ),
+                )
             point = np.asarray(pivot_candidates[chosen_pivot_source], dtype=np.float64)
             print(
                 f"[ArticulationFit] '{label}': chose pivot {chosen_pivot_source} with translation RMSE "

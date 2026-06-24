@@ -175,7 +175,10 @@ def infer_object_state_from_video(
     """Infer the object's resulting semantic state from inactive context plus active video."""
     default_result = {
         "mode": f"state_video_stride{QWEN_ACTIVE_VIDEO_FRAME_STRIDE}",
+        "object_state_before": "unknown",
+        "object_state_after": "unknown",
         "object_state": "unknown",
+        "status_changed": False,
         "confidence": 0.0,
         "reasoning": "",
         "inactive_context_frames": [],
@@ -258,38 +261,65 @@ def infer_object_state_from_video(
         {
             "interactive_element": "drawer handle",
             "object": "drawer",
+            "object_state_before": "closed",
+            "object_state_after": "open",
             "object_state": "open",
-            "why": "The drawer ends the clip pulled outward relative to the cabinet and remains open.",
+            "status_changed": True,
+            "why": "Before the interaction, the drawer is closed inside the cabinet. After the hand pulls the handle, the drawer remains pulled outward and open.",
         },
         {
             "interactive_element": "cabinet handle",
             "object": "cabinet door",
+            "object_state_before": "closed",
+            "object_state_after": "open",
+            "object_state": "open",
+            "status_changed": True,
+            "why": "Before the interaction, the cabinet door is closed. After the hand pulls the handle, the cabinet door swings away from the frame and remains open.",
+        },
+        {
+            "interactive_element": "cabinet handle",
+            "object": "cabinet door",
+            "object_state_before": "closed",
+            "object_state_after": "partially open",
             "object_state": "partially open",
-            "why": "The door swings away from the frame and remains ajar by the end of the clip.",
+            "status_changed": True,
+            "why": "Before the interaction, the cabinet door is closed. After the hand pulls the handle, the door is ajar but not fully open.",
         },
         {
             "interactive_element": "light switch",
             "object": "ceiling light",
+            "object_state_before": "off",
+            "object_state_after": "on",
             "object_state": "on",
-            "why": "The controlled light is visibly illuminated after the switch interaction.",
+            "status_changed": True,
+            "why": "Before the switch is pressed, the light is not illuminated. After the interaction, the controlled light is visibly on.",
         },
         {
             "interactive_element": "microwave button",
             "object": "microwave",
+            "object_state_before": "off",
+            "object_state_after": "activated",
             "object_state": "activated",
-            "why": "The appliance starts operating after the button press.",
+            "status_changed": True,
+            "why": "Before the button press, the microwave is inactive. After the interaction, the appliance starts operating or shows an activated state.",
         },
         {
             "interactive_element": "spoon handle",
             "object": "spoon",
+            "object_state_before": "resting",
+            "object_state_after": "picked up",
             "object_state": "picked up",
-            "why": "The spoon is lifted from its resting place and remains in the hand.",
+            "status_changed": True,
+            "why": "Before the interaction, the spoon is resting on or inside another object. After the hand grasps it, the spoon is lifted and remains in the hand.",
         },
         {
             "interactive_element": "container rim",
             "object": "container",
+            "object_state_before": "unknown",
+            "object_state_after": "unknown",
             "object_state": "unknown",
-            "why": "The object is moved, but there is no clear persistent semantic status beyond being carried.",
+            "status_changed": False,
+            "why": "The container is moved, but the video does not show a clear persistent semantic state such as open, closed, on, off, picked up, or placed down.",
         },
     ]
     if bundle.config.use_cot and bundle.is_qwen35_vl:
@@ -300,15 +330,18 @@ def infer_object_state_from_video(
             + inactive_context_note
             + sampled_note
             + (motion_summary + " " if motion_summary else "")
-            + "Infer the object's resulting semantic state AFTER the interaction. "
-            "Use the inactive image(s) as before-context and the video as the active interaction evidence. "
-            "Prefer short natural lowercase state phrases such as 'open', 'partially open', 'closed', 'on', 'off', 'locked', 'unlocked', 'activated', 'deactivated', 'picked up', 'placed down', or 'unknown'. "
-            "Be flexible: choose the most semantically faithful short phrase; it does NOT need to be a single word. "
-            "Only predict a concrete state when the clip shows a meaningful persistent state or configuration by the end of the clip. "
-            "If the clip only shows generic motion/manipulation without a clear persistent semantic outcome, output 'unknown'. "
-            "Do not describe geometry, axes, hinges, or numeric motion. Do not simply restate the action as a verb phrase like 'opening' if the resulting state is better expressed as 'open' or 'partially open'. "
+            + "Infer the object's semantic state BEFORE and AFTER the interaction. "
+            "Use the inactive image(s) and the beginning of the video to infer object_state_before. "
+            "Use the end of the active video to infer object_state_after and object_state. "
+            "If the previous stored state is reliable and visually consistent, you may use it as a prior for object_state_before, but visual evidence has priority. "
+            "Prefer stable final semantic states such as 'open', 'partially open', 'closed', 'on', 'off', 'locked', 'unlocked', 'activated', 'deactivated', 'picked up', 'placed down', 'resting', or 'unknown'. "
+            "Do not simply restate the action as an in-progress verb like 'opening', 'closing', or 'moving' if the final result is better described as 'open', 'closed', 'picked up', or 'placed down'. "
+            "Only predict a concrete state when the clip shows a meaningful persistent state or configuration. "
+            "If a before or after state is not visible enough, use 'unknown' for that field. "
+            "status_changed should be true only when the visible before and after states are meaningfully different. "
+            "Do not describe geometry, axes, hinges, or numeric motion. "
             f"Few-shot examples: {json.dumps(few_shots)}. "
-            "Reason carefully from the temporal evidence, then output ONLY JSON with keys: \"object_state\" (short lowercase phrase), \"confidence\" (float), and \"reasoning\" (short string)."
+            "Reason carefully from the temporal evidence, then output ONLY JSON with keys: \"object_state_before\", \"object_state_after\", \"object_state\", \"status_changed\", \"confidence\", and \"reasoning\"."
         )
         max_tokens = bundle.config.cot_max_tokens
         enable_reasoning = True
@@ -328,7 +361,9 @@ def infer_object_state_from_video(
             "If the clip only shows generic motion/manipulation without a clear persistent semantic outcome, output 'unknown'. "
             "Do not describe geometry, axes, hinges, or numeric motion. Do not simply restate the action as a verb phrase like 'opening' if the resulting state is better expressed as 'open' or 'partially open'. "
             f"Few-shot examples: {json.dumps(few_shots)}. "
-            "Output ONLY JSON with keys: \"object_state\" (short lowercase phrase), \"confidence\" (float), and \"reasoning\" (short string)."
+            "Output ONLY JSON with keys: "
+            "\"object_state_before\", \"object_state_after\", \"object_state\", "
+            "\"status_changed\", \"confidence\", and \"reasoning\"."
         )
         max_tokens = bundle.config.qwen_max_tokens
         enable_reasoning = False
@@ -340,28 +375,53 @@ def infer_object_state_from_video(
         enable_reasoning=enable_reasoning,
     )
     payload = safe_json_loads(raw)
-    candidate_state = ""
-    confidence = 0.0
-    reasoning = ""
-    if isinstance(payload, dict):
-        candidate_state = str(payload.get("object_state", payload.get("state", ""))).strip()
-        try:
-            confidence = float(payload.get("confidence", 0.0))
-        except Exception:
-            confidence = 0.0
-        reasoning = str(payload.get("reasoning", "")).strip()
-    if not candidate_state:
-        candidate_state = str(raw or "").strip().strip('"')
-    object_state = normalize_semantic_state(candidate_state)
-    reasoning = reasoning or str(raw or "").strip()
+    if not isinstance(payload, dict):
+        payload = {}
+
+    previous_state_norm = normalize_semantic_state(previous_object_state)
+
+    before_raw = str(payload.get("object_state_before", "")).strip()
+    after_raw = str(payload.get("object_state_after", payload.get("object_state", ""))).strip()
+    final_raw = str(payload.get("object_state", after_raw)).strip()
+
+    object_state_before = normalize_semantic_state(before_raw) if before_raw else previous_state_norm
+    object_state_after = normalize_semantic_state(after_raw) if after_raw else "unknown"
+    object_state = normalize_semantic_state(final_raw) if final_raw else object_state_after
+
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+
+    reasoning = str(payload.get("reasoning", "")).strip() or str(raw or "").strip()
+
+    status_changed_raw = payload.get("status_changed", None)
+    if isinstance(status_changed_raw, bool):
+        status_changed = status_changed_raw
+    else:
+        status_changed = (
+            object_state_before != "unknown"
+            and object_state_after != "unknown"
+            and object_state_before != object_state_after
+        )
+
+    if object_state_before == "unknown" or object_state_after == "unknown":
+        status_changed = False
+
     print(
-        f"[Qwen-State] clip={int(clip.clip_id)} object='{object_label}' inferred_state='{object_state}' confidence={confidence:.3f}"
+        f"[Qwen-State] clip={int(clip.clip_id)} object='{object_label}' "
+        f"before='{object_state_before}' after='{object_state_after}' final='{object_state}' "
+        f"changed={status_changed} confidence={confidence:.3f}"
     )
     if reasoning:
         print(f"[Qwen-State] reasoning: {reasoning}")
+
     return {
         "mode": f"state_video_stride{QWEN_ACTIVE_VIDEO_FRAME_STRIDE}",
+        "object_state_before": object_state_before,
+        "object_state_after": object_state_after,
         "object_state": object_state,
+        "status_changed": bool(status_changed),
         "confidence": float(confidence),
         "reasoning": reasoning,
         "inactive_context_frames": inactive_context_frame_ids,

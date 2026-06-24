@@ -229,6 +229,9 @@ def export_tracking_debug_assets(
     asset_prefix: str = "object",
 ) -> None:
     """Persist lightweight tracking debug for both rigid and articulated paths."""
+    # Disabled: tracking_debug is kept minimal (only the artipoint
+    # <label>_tracks / <label>_masks overlays written by run_artipoint).
+    return
     clip_dir = out_dir / f"clip_{clip.clip_id:03d}"
     safe_label = re.sub(r"[^a-z0-9]+", "_", str(label).strip().lower()).strip("_") or "item"
     asset_dir = clip_dir / "tracking_debug" / f"{asset_prefix}_{safe_label}"
@@ -759,6 +762,29 @@ def apply_articulation_constraint(
     except Exception as exc:  # noqa: BLE001 - log and propagate as None
         print(f"[ArticulationFit][Error] '{label}': {exc}. Dropping motion record.")
         return None
+    # Prior-based joint-type override. ArtiPoint classifies type from the screw PITCH,
+    # which is ~0 for BOTH a hinge (revolute) and a sideways-sliding drawer (prismatic),
+    # so a short, slightly-noisy drawer slide is fit as a small-angle arc and mislabelled
+    # revolute. When the moving-part label is clearly prismatic (drawer/tray/slide) and
+    # the fit came back revolute with near-zero pitch, trust the prior: relabel prismatic
+    # and set the axis to the net translation direction (axis_point is free for prismatic).
+    _label_l = str(label or "").lower()
+    _predicted_prismatic = any(k in _label_l for k in ("drawer", "tray", "pull-out", "pullout", "slide"))
+    if _predicted_prismatic and str(fit.get("joint_type", "")).lower() == "revolute" and abs(float(fit.get("pitch", 0.0))) < 0.2:
+        _poses = fit.get("reconstructed_pose_history") or []
+        if len(_poses) >= 2:
+            _p0 = np.asarray(_poses[0], dtype=np.float64)[:3, 3]
+            _p1 = np.asarray(_poses[-1], dtype=np.float64)[:3, 3]
+            _disp = _p1 - _p0
+            _dn = float(np.linalg.norm(_disp))
+            if _dn > 1e-6:
+                fit["joint_type"] = "prismatic"
+                fit["axis_direction"] = (_disp / _dn).astype(np.float32).tolist()
+                fit["axis_point"] = [0.0, 0.0, 0.0]
+                print(
+                    f"[ArticulationFit] '{label}': prismatic-prior override revolute->prismatic "
+                    f"(pitch={abs(float(fit.get('pitch', 0.0))):.3f}, net_disp={_dn*100:.1f}cm)"
+                )
     print(
         f"[ArticulationFit] '{label}': joint={fit['joint_type']} "
         f"axis_dir={np.round(fit['axis_direction'], 3).tolist()} "

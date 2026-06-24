@@ -251,13 +251,21 @@ def hand_object_contact_breakdown(
     object detection -> hand_contact flips to False).
     """
     if hand_dets is None or obj_dets is None:
+        # One detector is missing. Still surface the hand-side signals when the
+        # hand IS present, so we can tell whether the hand was confidently in
+        # contact while only the OBJECT detector dropped (e.g. fridge once the
+        # door swings open) — otherwise "missing_dets" hides which side failed.
+        hand_present = hand_dets is not None and getattr(hand_dets, "shape", [0])[0] > 0
+        hand_scores_m = [float(hand_dets[i, 4]) for i in range(hand_dets.shape[0])] if hand_present else []
+        hand_conf_m = any(s > thresh for s in hand_scores_m)
+        hand_contact_m = any(float(hand_dets[i, 5]) > 0 for i in range(hand_dets.shape[0])) if hand_present else False
         return {
             "hand_dets_present": hand_dets is not None,
             "obj_dets_present": obj_dets is not None,
-            "hand_confident": False,
+            "hand_confident": hand_conf_m,
             "obj_confident": False,
-            "hand_in_contact": False,
-            "best_hand_score": 0.0,
+            "hand_in_contact": hand_contact_m,
+            "best_hand_score": float(max(hand_scores_m)) if hand_scores_m else 0.0,
             "best_obj_score": 0.0,
             "contact": False,
             "first_failure": "missing_dets",
@@ -469,6 +477,22 @@ def hand_velocity(hand_observations: Sequence[Optional[np.ndarray]]) -> float:
     return float(sum(displacements) / len(displacements))
 
 
+def hand_travel_distance(hand_observations: Sequence[Optional[np.ndarray]]) -> float:
+    """Compute cumulative wrist travel across one observation sequence."""
+    travel = 0.0
+    prev = None
+    for obs in hand_observations:
+        if obs is None:
+            continue
+        current = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if current.size != 3 or not np.all(np.isfinite(current)):
+            continue
+        if prev is not None:
+            travel += float(np.linalg.norm(current - prev))
+        prev = current
+    return float(travel)
+
+
 def lostfound_contact_threshold(vel_prior: float, vel_post: float) -> int:
     """Return the LostFound contact threshold adjusted by velocity change."""
     return LOSTFOUND_BASE_THRESHOLD + LOSTFOUND_HIGH_THRESHOLD_BONUS * int(abs(vel_prior - vel_post) > HAND_VELOCITY_DIFF_THRESHOLD)
@@ -498,21 +522,36 @@ def infer_interaction_flags(samples: Sequence[dict]) -> None:
             vel_prior = hand_velocity(list(history))
             vel_post = hand_velocity([future.get(hand_key) for future in future_context])
             threshold = lostfound_contact_threshold(vel_prior, vel_post)
+            # Activation = contact + proximity ONLY (no wrist-travel / velocity /
+            # dwell / future-far gate). The interaction starts the moment the RCNN
+            # hand-object detector reports contact this frame AND the hand is within
+            # HAND_DISTANCE_THRESHOLD of the prior object, so a grasp that rests
+            # motionless on the object before moving it still starts on time
+            # (fixes the cabinet's late start + bad inactive prior). Isolated
+            # single-frame false contacts are rejected downstream by the radius-3
+            # smoothing in infer_smoothed_contact_flags, not by a motion gate.
+            proximity_contact = bool(
+                sample.get("hand_contact")
+                and hand_pos is not None
+                and dist is not None
+                and dist < HAND_DISTANCE_THRESHOLD
+            )
+            sample[f"{prefix}_proximity_contact"] = bool(proximity_contact)
 
             if not current_active:
-                if sample.get("hand_contact") and hand_pos is not None and dist is not None and dist < HAND_DISTANCE_THRESHOLD:
-                    future_far = all(
-                        (future.get(dist_key) is None or future.get(dist_key) > dist or not future.get("hand_contact", False))
-                        for future in future_context
-                    )
-                    if future_far and future_positive > threshold:
-                        current_active = True
+                if proximity_contact:
+                    current_active = True
+                    sample[f"{prefix}_activation_mode"] = "proximity_contact"
+                else:
+                    sample[f"{prefix}_activation_mode"] = ""
             else:
+                # End once the look-ahead no longer shows sustained contact.
                 if hand_pos is not None:
                     if future_positive <= threshold:
                         current_active = False
                 elif not sample.get("hand_contact") and future_positive == 0:
                     current_active = False
+                sample[f"{prefix}_activation_mode"] = str(sample.get(f"{prefix}_activation_mode", ""))
 
             sample[f"{prefix}_active"] = current_active
             if prefix == "left":
@@ -520,6 +559,7 @@ def infer_interaction_flags(samples: Sequence[dict]) -> None:
             else:
                 right_active = current_active
 
+        sample["proximity_contact"] = bool(
+            sample.get("left_proximity_contact") or sample.get("right_proximity_contact")
+        )
         sample["interaction_active"] = bool(sample.get("left_active") or sample.get("right_active"))
-
-

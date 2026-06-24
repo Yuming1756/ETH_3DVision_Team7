@@ -122,6 +122,12 @@ def apply_motion_coupling_guardrails(
         moving_part_label = str(moving_part_label).strip()
         if not moving_part_label:
             moving_part_label = None
+    # Qwen joint-type guess (revolute vs prismatic), used to pick the SAM3 object
+    # seed frame before the ArtiPoint fit knows the real joint type. Only meaningful
+    # for articulated objects; blank otherwise.
+    joint_type = str(payload.get("joint_type", "")).strip().lower()
+    if joint_type not in {"revolute", "prismatic"} or interaction_type != "articulated_object":
+        joint_type = ""
     return {
         "interaction_type": interaction_type,
         "shares_rigid_motion": shares,
@@ -129,6 +135,7 @@ def apply_motion_coupling_guardrails(
         "reasoning": reasoning,
         "static_parent_body": static_parent_body,
         "moving_part_label": moving_part_label,
+        "joint_type": joint_type,
     }
 
 

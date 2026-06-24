@@ -71,17 +71,39 @@ def resolve_local_hf_model_path(model_id: str, cache_dir: str) -> str:
             return str(latest)
     return model_id
 
+
+def _format_cuda_mem_snapshot() -> str:
+    """Return a compact summary of current CUDA memory usage for debugging."""
+    if not torch.cuda.is_available():
+        return "cuda unavailable"
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        return (
+            f"free={free_bytes / (1024**3):.2f} GiB / total={total_bytes / (1024**3):.2f} GiB, "
+            f"allocated={allocated / (1024**3):.2f} GiB, reserved={reserved / (1024**3):.2f} GiB"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"cuda mem unavailable ({exc})"
+
+
 # Thijs
 def load_qwen_bundle(config: PipelineConfig) -> QwenBundle:
     """Load the configured Qwen VL model using AutoConfig-based class dispatch."""
     print(f"Loading Qwen-VL ({config.qwen_vl_model_id})...")
-    # Free the GPU for 8-bit Qwen by moving the resident (plain, ~3GB) SAM3
-    # predictor to CPU while Qwen runs — 8-bit Qwen (~8GB) + activations does NOT
-    # fit beside a GPU-resident SAM3 on a 16GB card (it OOM'd). Plain SAM3 is small
-    # enough that the host stays under the 24G cap (the old host-OOM concern was
-    # SAM3-I at ~8GB). Skipped for the 4-bit escape hatch (it coexists fine).
-    if os.environ.get("GRAPH_QWEN_4BIT", "0") != "1":
-        _move_shared_sam3_predictor("cpu")
+    skip_allocator_warmup = os.environ.get("GRAPH_QWEN_SKIP_WARMUP", "1") == "1"
+    use_cpu_offload = os.environ.get("GRAPH_QWEN_CPU_OFFLOAD", "0") == "1"
+    offload_gpu_max_memory = os.environ.get("GRAPH_QWEN_GPU_MAX_MEMORY", "10GiB").strip() or "10GiB"
+    offload_cpu_max_memory = os.environ.get("GRAPH_QWEN_CPU_MAX_MEMORY", "60GiB").strip() or "60GiB"
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+    print(f"Qwen-VL pre-load CUDA memory: {_format_cuda_mem_snapshot()}")
     os.environ.setdefault("HF_HOME", config.hf_cache_dir)
     model_source = resolve_local_hf_model_path(config.qwen_vl_model_id, config.hf_cache_dir)
     if model_source != config.qwen_vl_model_id:
@@ -99,62 +121,44 @@ def load_qwen_bundle(config: PipelineConfig) -> QwenBundle:
     else:
         raise ValueError(f"Unsupported Qwen VL model_type: {model_type}")
 
-    # --- SAM3-I + Qwen GPU/RAM tuning notes (2026-06-09) -----------------------
-    # On the 16GB 5060ti the Qwen-8B (bf16 ~16GB) active-video generation fights
-    # SAM3-I for memory. Empirically, sweeping `max_memory[0]` gave NO stable
-    # operating point (the SLURM mem cap is 24G, not the requested 96G, which
-    # narrows the window further):
-    #   * <= 10GiB : Qwen offloads >6GiB to CPU -> active-video generation HANGS
-    #                (CPU-offloaded forward effectively deadlocks; 20-50min idle).
-    #   * 13-14GiB : Qwen actively generates but CUDA-OOMs on a ~1.16GiB
-    #                activation spike (only ~0.9GiB free).
-    #   * 12GiB    : host-RAM OOM-kill — moving SAM3-I (~8GB) to CPU via option B
-    #                while Qwen loads its 16GB to CPU exceeds the 24G SLURM cap.
-    # Conclusion: the move-SAM3-I-off-GPU approach is blocked by the 24G RAM cap;
-    # the robust fix is 4-bit Qwen (bitsandbytes, ~5GB fully on-GPU, NO offload),
-    # which fits beside SAM3-I (~8GB) with no shuffling. See _move_shared_sam3_predictor.
-    # ---------------------------------------------------------------------------
-    # FIX (2026-06-09): load Qwen in 4-bit (bitsandbytes NF4). The quantized model
-    # is ~5GB and sits ENTIRELY on the GPU (device_map={"": 0}) with NO CPU offload,
-    # so there is no hang and no host-RAM pressure. It coexists with the resident
-    # SAM3-I predictor (~8GB) inside the 16GB GPU (~13GB total). Quantization reads
-    # the bf16 weights to host once (~16GB peak, under the 24G SLURM cap) then frees
-    # them. Because Qwen no longer needs the GPU to itself, option B (moving SAM3-I
-    # off-GPU around Qwen) is disabled below — see release/load hooks.
-    # 8-bit is the DEFAULT now that SAM3-I is gone: on plain SAM3 there is no
-    # second large model competing for the 16GB GPU, so we keep Qwen at 8-bit
-    # (~8GB, device_map={"":0}) for materially better reasoning than 4-bit. 4-bit
-    # NF4 degraded reasoning enough to mislabel the cabinet interactive element as
-    # "cabinet door" instead of "cabinet handle" (-> element==object -> 0 edges).
-    # GRAPH_QWEN_4BIT=1 is a memory-pressure escape hatch only.
-    # Precision: default is the ORIGINAL full bf16 (no quantization) for best
-    # reasoning — SAM3 is offloaded to CPU around Qwen (above/below) so bf16 has the
-    # 16GB GPU to itself. GRAPH_QWEN_8BIT=1 / GRAPH_QWEN_4BIT=1 are memory-pressure
-    # escape hatches if bf16 OOMs.
-    load_kwargs: Dict[str, Any] = {
-        "device_map": {"": 0},          # whole model on GPU 0, no offload
+    load_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "attn_implementation": "sdpa",
         "local_files_only": config.local_files_only,
         "cache_dir": config.hf_cache_dir,
         "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
     }
-    if os.environ.get("GRAPH_QWEN_4BIT", "0") == "1":
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+    if use_cpu_offload:
+        load_kwargs["device_map"] = "auto"
+        load_kwargs["max_memory"] = {0: offload_gpu_max_memory, "cpu": offload_cpu_max_memory}
+        load_mode_text = (
+            "bf16 with CPU offload "
+            f"(gpu_max={offload_gpu_max_memory}, cpu_max={offload_cpu_max_memory})"
         )
-        print("  Qwen quantization: 4-bit NF4 (GRAPH_QWEN_4BIT=1 escape hatch)")
-    elif os.environ.get("GRAPH_QWEN_8BIT", "0") == "1":
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        print("  Qwen quantization: 8-bit (GRAPH_QWEN_8BIT=1)")
     else:
-        load_kwargs["torch_dtype"] = torch.bfloat16
-        print("  Qwen quantization: none — full bf16 (og default)")
-    model = model_cls.from_pretrained(
-        model_source,
-        **load_kwargs,
-    )
+        load_kwargs["device_map"] = {"": 0}
+        load_mode_text = "full bf16 on GPU 0 (no CPU offload)"
+    import transformers.modeling_utils as hf_modeling_utils
+    original_caching_allocator_warmup = getattr(hf_modeling_utils, "caching_allocator_warmup", None)
+    if skip_allocator_warmup and original_caching_allocator_warmup is not None:
+        print("Qwen-VL loader: skipping transformers caching_allocator_warmup")
+        hf_modeling_utils.caching_allocator_warmup = lambda *args, **kwargs: None
+    try:
+        try:
+            model = model_cls.from_pretrained(
+                model_source,
+                **load_kwargs,
+            )
+        except TypeError:
+            load_kwargs.pop("attn_implementation", None)
+            model = model_cls.from_pretrained(
+                model_source,
+                **load_kwargs,
+            )
+    finally:
+        if skip_allocator_warmup and original_caching_allocator_warmup is not None:
+            hf_modeling_utils.caching_allocator_warmup = original_caching_allocator_warmup
     processor = AutoProcessor.from_pretrained(
         model_source,
         local_files_only=config.local_files_only,
@@ -162,6 +166,12 @@ def load_qwen_bundle(config: PipelineConfig) -> QwenBundle:
         trust_remote_code=True,
     )
     is_qwen35_vl = ("3.5" in model_id_lower or "qwen3_5" in model_type) and "vl" in (model_type + model_id_lower)
+    print(f"Qwen-VL load mode: {load_mode_text}")
+    print(
+        f"Qwen-VL visual caps: image_max_pixels={int(QWEN_IMAGE_MAX_PIXELS)} "
+        f"video_max_pixels={int(QWEN_VIDEO_MAX_PIXELS)}"
+    )
+    print(f"Qwen-VL post-load CUDA memory: {_format_cuda_mem_snapshot()}")
     print(f"Qwen-VL ready. model_type={model_type}")
     return QwenBundle(model=model, processor=processor, model_type=model_type, is_qwen35_vl=is_qwen35_vl, config=config)
 
@@ -170,8 +180,12 @@ def release_qwen_bundle(bundle: Optional[QwenBundle]) -> None:
     """Release Qwen model resources aggressively before switching back to DA3."""
     if bundle is None:
         return
+    print(f"[MemProfile] Qwen release: BEFORE  {_format_cuda_mem_snapshot()}")
     model = getattr(bundle, 'model', None)
     processor = getattr(bundle, 'processor', None)
+    # Evict GPU weights to CPU FIRST: del + empty_cache alone does not reclaim the
+    # CUDA memory if any reference lingers (accelerate hooks / autocast / closures),
+    # which leaked ~2.4GiB per load/release cycle and OOM'd on the 3rd Qwen reload.
     try:
         if model is not None and hasattr(model, 'cpu'):
             model.cpu()
@@ -188,10 +202,7 @@ def release_qwen_bundle(bundle: Optional[QwenBundle]) -> None:
             torch.cuda.ipc_collect()
         except Exception:
             pass
-    # Move the SAM3 predictor back onto the GPU now that Qwen has freed its memory
-    # (mirrors the off-load in load_qwen_bundle; skipped for the 4-bit hatch).
-    if os.environ.get("GRAPH_QWEN_4BIT", "0") != "1":
-        _move_shared_sam3_predictor("cuda")
+    print(f"[MemProfile] Qwen release: AFTER   {_format_cuda_mem_snapshot()}")
 
 
 def ensure_qwen_bundle_loaded(bundle: Optional[QwenBundle], config: PipelineConfig) -> QwenBundle:
@@ -212,17 +223,35 @@ def ensure_qwen_bundle_loaded(bundle: Optional[QwenBundle], config: PipelineConf
 # Thijs
 def qwen_generate(bundle: QwenBundle, messages: List[dict], max_tokens: int, enable_reasoning: bool = False) -> str:
     """Run a Qwen generation pass and return the decoded response text."""
+    prepared_messages = copy.deepcopy(messages)
+    for message in prepared_messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).strip().lower()
+            if item_type == "image":
+                item.setdefault("max_pixels", int(QWEN_IMAGE_MAX_PIXELS))
+            elif item_type == "video":
+                item.setdefault("max_pixels", int(QWEN_VIDEO_MAX_PIXELS))
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     if enable_reasoning and bundle.is_qwen35_vl:
         template_kwargs["enable_thinking"] = True
-    text = bundle.processor.apply_chat_template(messages, **template_kwargs)
-    image_inputs, video_inputs = process_vision_info(messages)
+    text = bundle.processor.apply_chat_template(prepared_messages, **template_kwargs)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(prepared_messages, return_video_kwargs=True)
     device = next(bundle.model.parameters()).device
     processor_kwargs = {"text": [text], "return_tensors": "pt"}
     if image_inputs:
         processor_kwargs["images"] = image_inputs
     if video_inputs:
         processor_kwargs["videos"] = video_inputs
+        fps_value = video_kwargs.get("fps")
+        if isinstance(fps_value, list) and len(fps_value) == 1:
+            video_kwargs = dict(video_kwargs)
+            video_kwargs["fps"] = fps_value[0]
+        processor_kwargs.update(video_kwargs)
     inputs = bundle.processor(**processor_kwargs).to(device)
     with torch.inference_mode():
         generated = bundle.model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, repetition_penalty=1.1)
@@ -498,18 +527,55 @@ def detect_interaction_video(
         if inactive_context_frames
         else ""
     )
+    few_shots = [
+        {
+            "observation": "A hand pulls a drawer using the visible drawer handle.",
+            "interactive_element": "drawer handle",
+            "parent_object": "drawer",
+            "relation_scope": "local",
+            "why": "The handle is the touched functional part, and the manipulated parent object is the moving drawer, not the cabinet bank around it.",
+        },
+        {
+            "observation": "A hand opens a cabinet by gripping its handle.",
+            "interactive_element": "cabinet handle",
+            "parent_object": "cabinet door",
+            "relation_scope": "local",
+            "why": "The touched part is the handle, and the manipulated parent object is the moving cabinet door, not the whole cabinet body.",
+        },
+        {
+            "observation": "A hand grasps a spoon and carries it out of or away from a bowl.",
+            "interactive_element": "spoon handle",
+            "parent_object": "spoon",
+            "relation_scope": "local",
+            "why": "The spoon is the carried rigid object. The bowl is only nearby context or support, not the manipulated parent object.",
+        },
+        {
+            "observation": "A hand presses a light switch to control a ceiling light.",
+            "interactive_element": "light switch",
+            "parent_object": "ceiling light",
+            "relation_scope": "remote",
+            "why": "The touched control affects a separate target object's state, so this is a remote functional relation.",
+        },
+    ]
     shared_rules = (
         "Think in terms of a functional scene graph. "
-        "Identify the touched interactive element and the object node it functionally connects to. "
-        "A functional relationship is not a spatial relationship: inside, on, near, touching, holding, stored in, supported by, or next to are NOT valid object choices by themselves. "
+        "Identify the touched interactive element and the parent object being manipulated or controlled THROUGH that element. "
+        "A single parent object can have multiple interactive elements with different functions, so choose the part that is ACTUALLY touched in this clip, not merely the most salient object in view. "
+        "The interactive_element is the SMALL graspable functional part the hand makes direct contact with — a handle, knob, pull, grip, button, switch, lever, latch, or rim — NOT the large panel, door, drawer front, lid, or body it is attached to. "
+        "It must usually be a DIFFERENT, smaller label than the parent_object (e.g. interactive_element 'cabinet handle' with parent_object 'cabinet door'; NEVER interactive_element 'cabinet door' with parent_object 'cabinet door'). "
+        "A hinged door or sliding drawer is opened by gripping its handle, so when a hand opens one, name the handle as the interactive_element EVEN IF the door/drawer is already swung open and the handle is small, foreshortened, or partly hidden — infer the handle from how the part is being opened rather than labelling the whole moving body as the touched element. "
+        "Reason about the LOCAL functional relationship: what object does this touched part belong to, and what object is being manipulated through it? "
+        "A functional relationship is not a spatial relationship: inside, on, near, touching, holding, stored in, supported by, or next to are NOT valid parent-object choices by themselves. "
         "Use the video to decide whether there is REAL RELATIVE MOTION between a local part and the rest of the object. "
         "If a small object is simply carried through space as one rigid piece, choose the carried object itself as the parent object and do NOT name a lid/cap/door unless the video clearly shows that part moving relative to the rest of the object. "
+        "If a utensil or tool is grasped while resting in a bowl, rack, drawer, or holder, the utensil/tool is the parent object if IT is what moves with the hand; the container/support is only context unless it also moves. "
         "Only name a lid, cap, door, drawer, panel, or flap when the active video shows that part moving relative to a larger body. "
         "For local functional relations, choose the specific immediate moving part the touched element is rigidly attached to, OR the carried object itself if the whole object moves together. "
         "DO NOT name the larger static appliance / cabinet / chassis the moving part hinges on. "
         "Examples: drawer handle -> drawer (NOT cabinet); refrigerator door handle -> refrigerator door (NOT refrigerator); cabinet handle -> cabinet door (NOT cabinet); pot lid handle -> pot lid only if the lid moves relative to the pot; spoon handle -> spoon; mug handle -> mug; container rim -> container. "
         "For remote functional relations, choose the object whose state or function is controlled by the interactive element. Example: button -> ceiling light. "
         "Do not choose a nearby container, support, destination, or scene context unless it is the actual local parent object or the actual remote controlled target. "
+        f"Few-shot examples: {json.dumps(few_shots)}. "
         "Use specific labels like 'spoon handle', 'spoon', 'drawer handle', 'drawer', 'button', 'ceiling light'. "
         "Avoid generic labels like hand, person, room, floor, wall, appliance, or object unless no better label is possible. "
     )
@@ -520,12 +586,13 @@ def detect_interaction_video(
             + inactive_context_note
             + sampled_note
             + shared_rules
-            + "Reason carefully from the temporal evidence, but output ONLY the final JSON with keys: "
+            + "Reason carefully from the temporal evidence: first identify the touched part, then identify the parent object functionally manipulated through that part, then decide whether the relation is local or remote. "
+            + "Output ONLY the final JSON with keys: "
             "\"interactive_element\" (specific touched part, 1-4 lowercase words), "
             "\"parent_object\" (object node linked to the interactive element, 1-4 lowercase words), "
             "\"relation_scope\" ('local' or 'remote'), "
             "\"confidence\" (0.0-1.0), and "
-            "\"reasoning\" (short string). "
+            "\"reasoning\" (short string explaining the functional relationship). "
             "Return exactly one JSON object and do not wrap it in prose."
         )
         max_tokens = bundle.config.cot_max_tokens
@@ -537,12 +604,13 @@ def detect_interaction_video(
             + inactive_context_note
             + sampled_note
             + shared_rules
+            + "Internally decide: what part is touched, what object is manipulated through that part, and whether that pair is local or remote. "
             + "Output ONLY JSON with keys: "
             "\"interactive_element\" (specific touched part, 1-4 lowercase words), "
             "\"parent_object\" (object node linked to the interactive element, 1-4 lowercase words), "
             "\"relation_scope\" ('local' or 'remote'), "
             "\"confidence\" (0.0-1.0), and "
-            "\"reasoning\" (short string). "
+            "\"reasoning\" (short string explaining the functional relationship). "
             "Return exactly one JSON object and do not wrap it in prose."
         )
         max_tokens = bundle.config.qwen_max_tokens
@@ -610,6 +678,26 @@ def infer_interaction_hierarchy(
         hints.append(f"parent object hint: '{object_hint}'")
     hint_text = " ".join(hints) if hints else "No label hints are provided."
 
+    few_shots = [
+        {
+            "observation": "The crop shows a hand pulling a drawer by its handle.",
+            "interactive_element": "drawer handle",
+            "parent_object": "drawer",
+            "why": "The handle is the touched part, and the manipulated local object instance is the drawer itself.",
+        },
+        {
+            "observation": "The crop shows a hand opening a cabinet by gripping a handle.",
+            "interactive_element": "cabinet handle",
+            "parent_object": "cabinet door",
+            "why": "The touched part is the handle, and the manipulated local object is the moving cabinet door.",
+        },
+        {
+            "observation": "The crop shows a hand grasping a spoon resting in a bowl and lifting it away.",
+            "interactive_element": "spoon handle",
+            "parent_object": "spoon",
+            "why": "The bowl is just context or support; the spoon is the carried manipulated object.",
+        },
+    ]
     prompt = (
         ("The first image shows the inactive scene immediately before interaction. " if inactive_frame_rgb is not None else "")
         + "The next image is the first active frame. "
@@ -618,13 +706,17 @@ def infer_interaction_hierarchy(
         + hint_text
         + " Identify the specific touched part and the specific single manipulated local object instance it belongs to. "
         "This prompt is for local geometry only, not remote functional targets. "
-        "If the hand is grasping a movable tool or utensil taken from storage, choose the tool itself as the parent object. Example: spoon handle -> wooden spoon, not the drawer or dish rack. If the touched part is an appliance/cabinet door handle, choose the moving door/drawer, not the whole appliance/cabinet. Example: refrigerator door handle -> refrigerator door. "
+        "Think in OpenFunGraph-style local functional terms: what small part is directly touched, and what single local object is manipulated through that part. "
+        "If the hand is grasping a movable tool or utensil taken from storage, choose the tool itself as the parent object. Example: spoon handle -> spoon, not the bowl, drawer, dish rack, or holder around it. "
+        "If the touched part is an appliance/cabinet door handle, choose the moving door/drawer, not the whole appliance/cabinet. Example: refrigerator door handle -> refrigerator door. "
+        "Do not choose a nearby support or container just because the object starts inside or on it. If the hand lifts the spoon from a bowl, the parent object is the spoon. "
         "Do not describe the whole cabinet bank, wall, counter, or room; choose only the single parent object instance directly attached to or grasped with the touched part. "
+        f"Few-shot examples: {json.dumps(few_shots)}. "
         "Output ONLY JSON with keys: "
         "\"interactive_element\" (1-4 lowercase words), "
         "\"parent_object\" (1-4 lowercase words), "
         "\"confidence\" (0.0-1.0), and "
-        "\"reasoning\" (short string)."
+        "\"reasoning\" (short string explaining the local functional relationship)."
     )
     raw = vlm_generate(
         bundle,
@@ -931,6 +1023,186 @@ def infer_motion_coupling(
     return apply_motion_coupling_guardrails(payload, elem_label, obj_label, raw)
 
 
+def infer_sam_seed_endpoint(
+    bundle: QwenBundle,
+    clip: ClipInfo,
+    rgb_list: Sequence[np.ndarray],
+    element_label: str,
+    object_label: str,
+    motion_coupling: Optional[dict] = None,
+    previous_inactive_clip: Optional[ClipInfo] = None,
+) -> dict:
+    """Ask Qwen whether SAM should seed from the beginning, middle, or end of the active clip."""
+    default_choice = {
+        "seed_choice": "beginning",
+        "confidence": 0.0,
+        "reasoning": "",
+        "raw": "",
+    }
+    if not rgb_list:
+        return dict(default_choice)
+
+    begin_rgb = prepare_full_frame_for_qwen(np.asarray(rgb_list[0], dtype=np.uint8))
+    middle_idx = max(0, min(len(rgb_list) - 1, len(rgb_list) // 2))
+    middle_rgb = prepare_full_frame_for_qwen(np.asarray(rgb_list[middle_idx], dtype=np.uint8))
+    end_rgb = prepare_full_frame_for_qwen(np.asarray(rgb_list[-1], dtype=np.uint8))
+    content: List[dict] = []
+    inactive_note = ""
+    if previous_inactive_clip is not None and previous_inactive_clip.samples:
+        inactive_sample = None
+        for sample in reversed(previous_inactive_clip.samples):
+            if sample.get("rgb_valid", True):
+                inactive_sample = sample
+                break
+        if inactive_sample is None:
+            inactive_sample = previous_inactive_clip.samples[-1]
+        bgr = cv2.imread(str(inactive_sample["rgb_path"]))
+        if bgr is not None:
+            inactive_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            content.append({"type": "image", "image": image_to_data_url(prepare_full_frame_for_qwen(inactive_rgb))})
+            inactive_note = "Image 1 is the last inactive frame before manipulation. "
+    content.extend(
+        [
+            {"type": "image", "image": image_to_data_url(begin_rgb)},
+            {"type": "image", "image": image_to_data_url(middle_rgb)},
+            {"type": "image", "image": image_to_data_url(end_rgb)},
+        ]
+    )
+    qwen_joint_type = str((motion_coupling or {}).get("joint_type", "")).strip().lower() or "unknown"
+    few_shots = [
+        {
+            "interactive_element": "drawer handle",
+            "moving_object": "drawer",
+            "joint_type": "prismatic",
+            "choice": "end",
+            "why": "A drawer is most fully revealed at the end, so the moving drawer body is easier to segment than near the beginning or middle when it is still partly inside the cabinet.",
+        },
+        {
+            "interactive_element": "cabinet handle",
+            "moving_object": "cabinet door",
+            "joint_type": "revolute",
+            "choice": "beginning",
+            "why": "A cabinet door is usually least distorted near the beginning; middle or end can create foreshortening, overlap with neighboring doors, and confusing silhouettes.",
+        },
+        {
+            "interactive_element": "hand",
+            "moving_object": "bowl",
+            "joint_type": "rigid",
+            "choice": "end",
+            "why": "There are several identical bowls next to/stacked with each other, so at the beginning the target bowl is ambiguous and SAM3 may seed the WRONG instance. By the end the manipulated bowl has been lifted/carried AWAY from its identical neighbors, so it is spatially separated and unambiguous to segment as the correct single instance.",
+        },
+    ]
+    prompt = (
+        f"{inactive_note}"
+        "The next image is the BEGINNING of the active clip. "
+        "The following image is the MIDDLE of the active clip. "
+        "The final image is the END of the active clip. "
+        f"We are segmenting the moving object/part '{object_label}' that is manipulated via '{element_label}'. "
+        f"Qwen's current motion guess is joint_type='{qwen_joint_type}'. "
+        "Choose exactly one SAM seed location: 'beginning', 'middle', or 'end'. "
+        "Pick the endpoint where the MOVING OBJECT/PART itself is easiest to segment as one correct instance with the most useful visual information. "
+        "Prefer the view where the manipulated part is most visible, least occluded, and least likely to merge with neighboring static structure. "
+        "For sliding drawers/trays, the end is often better because the moved body becomes revealed only after translation. "
+        "For revolving cabinet/fridge doors, the beginning is often better because later rotation can create foreshortening, overlap, and visual distortion. "
+        "IMPORTANT: if there are MULTIPLE SIMILAR/IDENTICAL objects of the same kind near the target (e.g. several bowls, cups, plates, or bottles together), prefer the 'end', because by then the manipulated instance has been carried away and is spatially SEPARATED from its look-alikes, so SAM3 seeds the correct single instance instead of an ambiguous merged/wrong one. "
+        "Use 'middle' only if it clearly offers the best balance of visibility and low distortion. "
+        f"Few-shot examples: {json.dumps(few_shots)}. "
+        "Reason step by step internally, but output ONLY one JSON object with keys: "
+        "\"seed_choice\" ('beginning', 'middle', or 'end'), \"confidence\" (0.0-1.0), and \"reasoning\" (short string)."
+    )
+    content.append({"type": "text", "text": prompt})
+    raw = vlm_generate(
+        bundle,
+        [{"role": "user", "content": content}],
+        max_tokens=bundle.config.cot_max_tokens if (bundle.config.use_cot and bundle.is_qwen35_vl) else bundle.config.qwen_max_tokens,
+        enable_reasoning=bool(bundle.config.use_cot and bundle.is_qwen35_vl),
+    )
+    payload = safe_json_loads(raw) or {}
+    choice = str(payload.get("seed_choice", "")).strip().lower()
+    if choice in {"start", "first", "begin", "beginning"}:
+        choice = "beginning"
+    elif choice in {"middle", "mid", "center", "centre"}:
+        choice = "middle"
+    elif choice in {"end", "last", "final"}:
+        choice = "end"
+    else:
+        choice = "beginning"
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+    return {
+        "seed_choice": choice,
+        "confidence": confidence,
+        "reasoning": str(payload.get("reasoning", "")).strip() or raw,
+        "raw": raw,
+    }
+
+
+def infer_element_seed_frame(
+    bundle: QwenBundle,
+    active_rgb_list: Sequence[np.ndarray],
+    element_label: str,
+    object_label: str,
+) -> dict:
+    """Ask Qwen whether to seed the element (handle) at the FIRST or LAST active frame.
+
+    Like the object seed, the element is now seeded from the ACTIVE clip. Qwen is
+    shown the BEGINNING / MIDDLE / END of the active clip but must pick a BINARY
+    SAM seed location — 'beginning' (first active frame) or 'end' (last active
+    frame) — choosing where the element is the cleanest single instance to segment
+    (handle visible/separated, least occluded by the gripping hand). Defaults to
+    'beginning'.
+    """
+    default_choice = {"seed_choice": "beginning", "confidence": 0.0, "reasoning": "", "raw": ""}
+    if active_rgb_list is None or len(active_rgb_list) == 0:
+        return dict(default_choice)
+    n = len(active_rgb_list)
+    begin_rgb = prepare_full_frame_for_qwen(np.asarray(active_rgb_list[0], dtype=np.uint8))
+    middle_rgb = prepare_full_frame_for_qwen(np.asarray(active_rgb_list[n // 2], dtype=np.uint8))
+    end_rgb = prepare_full_frame_for_qwen(np.asarray(active_rgb_list[-1], dtype=np.uint8))
+    content = [
+        {"type": "image", "image": image_to_data_url(begin_rgb)},
+        {"type": "image", "image": image_to_data_url(middle_rgb)},
+        {"type": "image", "image": image_to_data_url(end_rgb)},
+    ]
+    prompt = (
+        "These three images are the BEGINNING, MIDDLE, and END of the active manipulation clip "
+        f"where a hand manipulates the '{object_label}' via its '{element_label}'. "
+        f"We must seed SAM3 on the '{element_label}' at EITHER the first (beginning) OR the last (end) active frame. "
+        "Choose the ONE binary location where the "
+        f"'{element_label}' is EASIEST to segment as a single correct instance: most visible, largest/most frontal, "
+        "least occluded by the gripping hand, and least likely to merge with a neighbouring identical part. "
+        "Often the beginning is best because the hand has not yet fully wrapped the handle; but if the part is only "
+        "clearly separated from look-alikes (or only revealed) after the motion, choose the end. "
+        "Reason step by step internally, but output ONLY one JSON object with keys: "
+        "\"seed_choice\" ('beginning' or 'end'), \"confidence\" (0.0-1.0), and \"reasoning\" (short string)."
+    )
+    content.append({"type": "text", "text": prompt})
+    raw = vlm_generate(
+        bundle,
+        [{"role": "user", "content": content}],
+        max_tokens=bundle.config.cot_max_tokens if (bundle.config.use_cot and bundle.is_qwen35_vl) else bundle.config.qwen_max_tokens,
+        enable_reasoning=bool(bundle.config.use_cot and bundle.is_qwen35_vl),
+    )
+    payload = safe_json_loads(raw) or {}
+    choice = str(payload.get("seed_choice", "")).strip().lower()
+    if choice in {"end", "last", "final"}:
+        choice = "end"
+    else:
+        choice = "beginning"
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+    return {
+        "seed_choice": choice,
+        "confidence": confidence,
+        "reasoning": str(payload.get("reasoning", "")).strip() or raw,
+        "raw": raw,
+    }
+
+
 def choose_keyframes(clip: ClipInfo, rgb_list: Sequence[np.ndarray]) -> Tuple[List[np.ndarray], List[dict]]:
     """Pick representative keyframes and matching sample metadata for Qwen."""
     if not rgb_list:
@@ -954,7 +1226,9 @@ def compare_detection_views(
     """Run active-clip video interaction detection with Qwen and save the comparison record."""
     inactive_context_frames: List[np.ndarray] = []
     inactive_context_frame_ids: List[int] = []
-    if previous_inactive_clip is not None and K_color is not None and D_color is not None and previous_inactive_clip.samples:
+    if not QWEN_CONTEXT_FRAMES:
+        print(f"[Qwen-Detect][Ablation] clip={int(clip.clip_id)} QWEN_CONTEXT_FRAMES=0 — NOT showing Qwen any inactive context frames.")
+    if QWEN_CONTEXT_FRAMES and previous_inactive_clip is not None and K_color is not None and D_color is not None and previous_inactive_clip.samples:
         valid_inactive_indices = [idx for idx, sample in enumerate(previous_inactive_clip.samples) if sample.get("rgb_valid", True)]
         source_indices = valid_inactive_indices if valid_inactive_indices else list(range(len(previous_inactive_clip.samples)))
         inactive_indices = sorted({source_indices[max(0, len(source_indices) // 2)], source_indices[-1]})
@@ -1154,3 +1428,56 @@ def refine_entity_caption(
     return (canonical, description)
 
 
+def infer_label_candidates(
+    bundle: QwenBundle,
+    captions: Sequence[str],
+    entity_kind: str,
+    label_hint: str,
+    description: str = "",
+    top_k: int = 5,
+) -> List[str]:
+    """Ask Qwen for a RANKED list of ``top_k`` alternative labels (for recall@K).
+
+    Returns up to ``top_k`` short lowercase noun-phrase labels, most-likely first,
+    with ``label_hint`` guaranteed to appear (deduped, order-preserving). Text-only
+    (reuses the per-view captions), so it adds no image pass.
+    """
+    cleaned = [str(c).strip() for c in (captions or []) if str(c).strip()]
+    role_text = "interactive element/part" if entity_kind == "element" else "object"
+    context = "\n".join(f"- {c}" for c in cleaned) if cleaned else "(no captions)"
+    desc_clause = f" Current description: {description}." if description else ""
+    prompt = (
+        f"We are labelling a single {role_text} seen in an egocentric interaction."
+        f" Best-guess label: '{label_hint}'.{desc_clause}"
+        f" Propose the {int(top_k)} MOST LIKELY concrete labels for it, ranked from"
+        " most to least likely. Each label must be a short generic noun phrase"
+        " (1-3 lowercase words, no punctuation), e.g. 'bowl', 'cabinet door',"
+        " 'drawer handle'. Include the best guess. Do NOT invent unrelated objects."
+        " Output ONLY JSON: {\"labels\": [\"...\", \"...\"]}."
+        f"\n\nCaptions:\n{context}"
+    )
+    labels: List[str] = []
+    try:
+        raw = vlm_generate(
+            bundle,
+            [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+            max_tokens=bundle.config.qwen_max_tokens,
+            enable_reasoning=False,
+        )
+        payload = safe_json_loads(raw) or {}
+        for item in (payload.get("labels") or []):
+            lab = str(item or "").strip().lower()
+            if lab:
+                labels.append(lab)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Qwen-Labels] candidate-label inference failed: {exc}")
+    # Guarantee the best guess is present and dedupe order-preserving.
+    hint = str(label_hint or "").strip().lower()
+    ordered = ([hint] if hint else []) + labels
+    seen: set = set()
+    out: List[str] = []
+    for lab in ordered:
+        if lab and lab not in seen:
+            seen.add(lab)
+            out.append(lab)
+    return out[: int(top_k)]

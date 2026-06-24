@@ -390,23 +390,40 @@ def _save_artipoint_keypoints_imagery(
 
 
 def _save_artipoint_mask_sequence(
-    out_dir: Path,
+    debug_dir: Path,
     rgb_list: Sequence[np.ndarray],
     active_masks: Optional[Sequence[np.ndarray]],
+    label: str,
 ) -> None:
-    """Save raw per-frame active masks for ArtiPoint debugging."""
+    """Visualize the propagated active object mask, one image per frame.
+
+    Writes to a dedicated ``<label>_masks/`` folder (NOT under ``_tracks/``), and
+    ONLY for frames whose propagated mask is non-empty (>0 px) — so the folder
+    contains exactly the frames where segmentation effectively produced a mask.
+    Each image overlays the mask translucently on the RGB frame with its bbox so
+    the segmented region (and whether it landed on the right instance) is visible.
+    """
     if active_masks is None or len(rgb_list) == 0:
         return
-    mask_dir = Path(out_dir) / "active_query_masks"
+    mask_dir = Path(debug_dir) / f"{_slugify_label(label)}_masks"
     mask_dir.mkdir(parents=True, exist_ok=True)
     image_shape = np.asarray(rgb_list[0], dtype=np.uint8).shape[:2]
     for frame_idx, mask in enumerate(active_masks[: len(rgb_list)]):
         mask_arr = np.asarray(mask, dtype=bool)
         if mask_arr.shape[:2] != image_shape:
             continue
-        mask_canvas = np.zeros((*image_shape, 3), dtype=np.uint8)
-        _blend_debug_mask_on_canvas(mask_canvas, mask_arr, color=(255, 80, 80), alpha=1.0)
-        cv2.imwrite(str(mask_dir / f"mask_{int(frame_idx):04d}.png"), cv2.cvtColor(mask_canvas, cv2.COLOR_RGB2BGR))
+        area = int(np.count_nonzero(mask_arr))
+        if area == 0:
+            continue  # only frames with an effectively propagated mask
+        canvas = np.asarray(rgb_list[frame_idx], dtype=np.uint8).copy()
+        _blend_debug_mask_on_canvas(canvas, mask_arr, color=(255, 80, 80), alpha=0.45)
+        bbox = mask_to_bbox(mask_arr)
+        if bbox is not None:
+            bx1, by1, bx2, by2 = [int(v) for v in bbox]
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (80, 255, 80), 2)
+        cv2.putText(canvas, f"frame {int(frame_idx):04d}  area={area}", (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.imwrite(str(mask_dir / f"mask_{int(frame_idx):04d}.png"), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
 
 def _save_artipoint_tracks_imagery(
@@ -416,6 +433,7 @@ def _save_artipoint_tracks_imagery(
     visibility: np.ndarray,
     label: str,
     active_masks: Optional[Sequence[np.ndarray]] = None,
+    element_masks: Optional[Sequence[np.ndarray]] = None,
     trail_frames: int = 12,
 ) -> None:
     """Save per-frame ArtiPoint track overlays, optionally with live SAM masks.
@@ -458,7 +476,12 @@ def _save_artipoint_tracks_imagery(
     visible_counts_by_frame: List[int] = []
     mask_pixels_by_frame: List[int] = []
 
-    _save_artipoint_mask_sequence(out_dir, rgb_list, active_masks)
+    # Object mask sequence (<label>_masks/) plus, when provided, the element/
+    # part mask sequence (<label>_element_masks/) so the debug shows BOTH the
+    # object and the element segmentation per frame.
+    _save_artipoint_mask_sequence(debug_dir, rgb_list, active_masks, label)
+    if element_masks is not None:
+        _save_artipoint_mask_sequence(debug_dir, rgb_list, element_masks, f"{label}_element")
 
     for frame_idx in range(n_frames):
         canvas = np.asarray(rgb_list[frame_idx], dtype=np.uint8).copy()
@@ -582,6 +605,4 @@ def _save_artipoint_tracks_imagery(
             handle,
             indent=2,
         )
-
-
 

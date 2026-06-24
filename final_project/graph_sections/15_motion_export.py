@@ -323,6 +323,10 @@ def export_viser_motion_bundle(
     hand_anchor_mode: Optional[str],
 ) -> None:
     """Export per-frame object geometry and wrist markers for direct Viser inspection."""
+    # Disabled: viser_motion is an extra per-frame debug bundle. The live viser
+    # viewer (viser_io.py) only needs scene_graph/ + viser_wrist/, which are
+    # still written, so this folder is removed to keep the debug output minimal.
+    return
     if motion_record is None:
         return
     pose_history = list(motion_record.get("pose_history", []) or [])
@@ -454,8 +458,8 @@ def export_lostfound_debug_assets(
     asset_prefix: str,
 ) -> None:
     """Export per-clip LostFound overlays and point clouds (debug-only; gated by GRAPH_DEBUG_IMAGES)."""
-    if not DEBUG_IMAGES_ENABLED:
-        return
+    # Disabled: tracking_debug is kept minimal (only the artipoint overlays).
+    return
     clip_dir = out_dir / f"clip_{clip.clip_id:03d}"
     asset_dir = clip_dir / "tracking_debug" / f"{asset_prefix}_{_slugify_label(label)}"
     asset_dir.mkdir(parents=True, exist_ok=True)

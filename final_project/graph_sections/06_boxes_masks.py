@@ -394,6 +394,162 @@ def select_primary_hand_anchor_point(
     return 0.5 * w, 0.5 * h
 
 
+def choose_best_sam_seed_frame(
+    samples: Sequence[dict],
+    *,
+    preferred_hand: Optional[str] = None,
+    prefer_contact: bool = False,
+    prefer_early: bool = False,
+) -> int:
+    """Pick the best clip frame to seed SAM3 propagation from.
+
+    We keep the propagation behavior from the last commit (single prompt frame,
+    then propagate both directions across the whole clip), but replace the old
+    fixed "first/last valid frame" choice with a scored selection:
+
+    - active clips prefer confident hand+object contact frames,
+    - inactive clips naturally fall back to object visibility + recency,
+    - both use the same logic.
+    """
+    valid_indices = [
+        idx for idx, sample in enumerate(samples)
+        if bool(sample.get("rgb_valid", True))
+    ]
+    if not valid_indices:
+        return 0
+
+    preferred_hand = str(preferred_hand or "").strip().lower()
+    n = max(len(samples) - 1, 1)
+    if prefer_early:
+        # Seed at the EARLIEST clear frame (hand just on the object, before it moves):
+        # first valid frame with hand contact or a confident detection; else earliest.
+        for idx in valid_indices:
+            sample = samples[idx]
+            hand_contact = bool(sample.get("hand_contact", False))
+            if preferred_hand in {"left", "right"}:
+                hand_contact = hand_contact or bool(sample.get(f"{preferred_hand}_active", False))
+            object_boxes = _confident_detection_boxes(sample.get("obj_dets"))
+            obj_score = max((float(s) for _b, s in object_boxes), default=0.0)
+            if hand_contact or obj_score > 0.0:
+                return int(idx)
+        return int(valid_indices[0])
+    best_idx = valid_indices[-1]
+    best_score = None
+
+    for idx in valid_indices:
+        sample = samples[idx]
+        object_boxes = _confident_detection_boxes(sample.get("obj_dets"))
+        hand_boxes = _confident_detection_boxes(sample.get("hand_dets"))
+        obj_score = max((float(score) for _box, score in object_boxes), default=0.0)
+        hand_score = max((float(score) for _box, score in hand_boxes), default=0.0)
+        hand_contact = bool(sample.get("hand_contact", False))
+        if preferred_hand in {"left", "right"}:
+            hand_contact = hand_contact or bool(sample.get(f"{preferred_hand}_active", False))
+        nearest_dist = None
+        dist_keys: List[str] = []
+        if preferred_hand in {"left", "right"}:
+            dist_keys.append(f"{preferred_hand}_nearest_object_distance")
+        dist_keys.extend(["left_nearest_object_distance", "right_nearest_object_distance"])
+        seen_keys = set()
+        for key in dist_keys:
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            value = sample.get(key)
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except Exception:
+                continue
+            if np.isfinite(value_f):
+                nearest_dist = value_f if nearest_dist is None else min(nearest_dist, value_f)
+        dist_bonus = 0.0
+        if nearest_dist is not None:
+            dist_bonus = max(0.0, 1.0 - nearest_dist / max(float(HAND_DISTANCE_THRESHOLD), 1e-6))
+        contact_bonus = 2.0 if hand_contact else 0.0
+        if prefer_contact and hand_contact:
+            contact_bonus += 2.0
+        # Tiebreak by recency by default; for active clips prefer EARLY frames where
+        # the touched object is clear (door closed, not yet swung over a neighbour).
+        frame_bonus = (1.0 - float(idx) / float(n)) if prefer_early else (float(idx) / float(n))
+        score = (
+            float(obj_score + 0.35 * hand_score + contact_bonus + 0.5 * dist_bonus),
+            frame_bonus,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = int(idx)
+    return int(best_idx)
+
+
+def choose_boundary_inactive_seed_frame(
+    samples: Sequence[dict],
+    *,
+    preferred_hand: Optional[str] = None,
+    tail_frames: int = 12,
+) -> int:
+    """Pick a grasp-near seed from the tail of the inactive clip.
+
+    This is used for late-start revolute clips: even if the active segment only
+    begins once the door is already partly open, the best boundary seed often
+    lives in the last few inactive frames where the hand is already on the
+    handle but the object is still in the closed/rest pose.
+    """
+    valid_indices = [
+        idx for idx, sample in enumerate(samples)
+        if bool(sample.get("rgb_valid", True))
+    ]
+    if not valid_indices:
+        return 0
+    tail_count = max(1, int(tail_frames))
+    candidate_indices = valid_indices[-tail_count:]
+    preferred_hand = str(preferred_hand or "").strip().lower()
+    n = max(len(samples) - 1, 1)
+    best_idx = candidate_indices[-1]
+    best_score = None
+
+    for idx in candidate_indices:
+        sample = samples[idx]
+        object_boxes = _confident_detection_boxes(sample.get("obj_dets"))
+        hand_boxes = _confident_detection_boxes(sample.get("hand_dets"))
+        obj_score = max((float(score) for _box, score in object_boxes), default=0.0)
+        hand_score = max((float(score) for _box, score in hand_boxes), default=0.0)
+        hand_contact = bool(sample.get("hand_contact", False))
+        nearest_dist = None
+        dist_keys: List[str] = []
+        if preferred_hand in {"left", "right"}:
+            dist_keys.append(f"{preferred_hand}_nearest_object_distance")
+        dist_keys.extend(["left_nearest_object_distance", "right_nearest_object_distance"])
+        seen_keys = set()
+        for key in dist_keys:
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            value = sample.get(key)
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except Exception:
+                continue
+            if np.isfinite(value_f):
+                nearest_dist = value_f if nearest_dist is None else min(nearest_dist, value_f)
+        dist_bonus = 0.0
+        if nearest_dist is not None:
+            dist_bonus = max(0.0, 1.0 - nearest_dist / max(float(HAND_DISTANCE_THRESHOLD), 1e-6))
+        contact_bonus = 2.0 if hand_contact else 0.0
+        recency_bonus = float(idx) / float(n)
+        score = (
+            float(obj_score + 0.35 * hand_score + contact_bonus + 0.5 * dist_bonus),
+            recency_bonus,
+        )
+        if best_score is None or score > best_score:
+            best_idx = idx
+            best_score = score
+    return int(best_idx)
+
+
 def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     """Return the tight bounding box of a binary mask or None if empty."""
     mask_bool = np.asarray(mask, dtype=bool)
@@ -557,6 +713,86 @@ def keep_mask_component_nearest_point(
     return (labels == best_label)
 
 
+def choose_best_object_prompt_frame(
+    samples: Sequence[dict],
+    element_masks: Sequence[np.ndarray],
+    *,
+    fallback_index: int = 0,
+    prefer_early: bool = False,
+) -> int:
+    """Choose the best frame to seed object SAM3 from the propagated element mask.
+
+    For both active and inactive clips we want the same rule:
+    pick a frame where the element mask is present and not obviously bloated,
+    then prefer stronger detections and slightly later frames.
+    """
+    valid_indices = [
+        idx
+        for idx, mask in enumerate(element_masks)
+        if idx < len(samples)
+        and bool(samples[idx].get("rgb_valid", True))
+        and np.any(np.asarray(mask, dtype=bool))
+    ]
+    if not valid_indices:
+        return int(fallback_index)
+
+    elem_areas = {
+        idx: int(np.count_nonzero(np.asarray(element_masks[idx], dtype=bool)))
+        for idx in valid_indices
+    }
+    median_area = float(np.median([elem_areas[idx] for idx in valid_indices])) if valid_indices else 0.0
+    clean_indices = [
+        idx
+        for idx in valid_indices
+        if elem_areas[idx] >= 64
+        and elem_areas[idx] <= max(2.0 * median_area, 64.0)
+    ]
+    pool = clean_indices if clean_indices else valid_indices
+
+    n = max(len(samples) - 1, 1)
+    if prefer_early:
+        # Seed at the earliest frame where the object is sufficiently VISIBLE, not just
+        # the earliest detected. A door is strongly detected even when closed -> seeds
+        # early (avoiding the swing over a near-identical neighbour); a drawer is only
+        # weakly detected closed -> it waits until pulled open and clearly visible.
+        # Gate on the detection being a real fraction of the clip's best object score.
+        pool_obj_scores = {
+            idx: max(
+                (float(score) for _box, score in _confident_detection_boxes(samples[idx].get("obj_dets"))),
+                default=0.0,
+            )
+            for idx in pool
+        }
+        max_obj_score = max(pool_obj_scores.values(), default=0.0)
+        visibility_floor = 0.6 * max_obj_score
+        if max_obj_score > 0.0:
+            for idx in pool:
+                if pool_obj_scores[idx] >= visibility_floor:
+                    return int(idx)
+        # No usable object detection anywhere: fall back to the earliest hand-contact
+        # frame, else the earliest pooled frame.
+        for idx in pool:
+            if bool(samples[idx].get("hand_contact", False)):
+                return int(idx)
+        return int(pool[0])
+    best_idx = int(pool[-1])
+    best_score = None
+    for idx in pool:
+        sample = samples[idx]
+        object_boxes = _confident_detection_boxes(sample.get("obj_dets"))
+        obj_score = max((float(score) for _box, score in object_boxes), default=0.0)
+        hand_contact = bool(sample.get("hand_contact", False))
+        recency_bonus = float(idx) / float(n)
+        score = (
+            float(obj_score + (0.5 if hand_contact else 0.0)),
+            recency_bonus,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_idx = int(idx)
+    return int(best_idx)
+
+
 def stabilize_mask_sequence_near_anchor(
     masks: Sequence[np.ndarray],
     anchor_point_xy: Tuple[float, float],
@@ -610,9 +846,12 @@ def constrain_part_masks_inside_object(
     for part_mask, object_mask in zip(part_masks, object_masks):
         part = np.asarray(part_mask, dtype=bool)
         obj = np.asarray(object_mask, dtype=bool)
-        candidate = (part & obj) if np.any(part) and np.any(obj) else part.copy()
-        if not np.any(candidate):
+        if np.any(part) and np.any(obj):
+            candidate = (part & obj)
+        elif np.any(part) and not np.any(obj):
             candidate = part.copy()
+        else:
+            candidate = np.zeros_like(part, dtype=bool)
         if reference_point is None:
             bbox = mask_to_bbox(candidate)
             if bbox is None and np.any(obj):
@@ -730,17 +969,15 @@ def compute_sam3_mask_confidence_metadata(
             dist = float(np.linalg.norm(center - median_center))
             box_score = float(np.clip(1.0 - dist / max(diag * SAM3_BOX_CENTER_OUTLIER_RATIO, 1e-6), 0.0, 1.0))
         component_score = connected_component_quality(mask)
-        # TEMP DEBUG (2026-06-09): area/box consistency punish the legitimately
-        # MOVING active object (drawer/cabinet door opening changes its mask area
-        # and center, which these static-assumption checks read as a tracking
-        # error -> 25/27 object frames discarded). Dropped from the confidence sum
-        # (prob+component renormalized from 0.35+0.20 -> ~0.64/0.36); the two terms
-        # are still recorded in metadata below for inspection. REVERT to restore the
-        # 0.35/0.25/0.20/0.20 blend once a motion-aware path is wired in.
-        confidence = float(
-            0.64 * raw_prob
-            + 0.36 * component_score
-        )
+        # Confidence is now SAM3's genuine per-frame propagation score alone
+        # (out_sam2_probs, captured upstream as raw_prob). The previous blend with
+        # mask-consistency heuristics (area/box/component) was a PSEUDO confidence
+        # that (a) punished the legitimately moving active object and (b) papered
+        # over the fact that the raw prob we were reading (out_probs) was a
+        # constant first-frame detection score. With a real per-frame score we
+        # trust it directly; area/box/component are still recorded for inspection
+        # but no longer alter the confidence.
+        confidence = float(raw_prob)
         native_box = native_boxes[idx] if idx < len(native_boxes) else None
         native_box_xywh = None
         if native_box is not None:
@@ -853,58 +1090,11 @@ def build_interaction_aware_sam_text(
     role: str = 'object',
     active: bool = False,
 ) -> str:
-    """Build a SAM text prompt from the Qwen interaction result.
-
-    For plain SAM3 (``_SAM_PROMPT_SIMPLE``) this collapses to the bare label,
-    which is the only form plain SAM3 grounds on reliably.
-    """
+    """Return the last-commit SAM prompt style: the bare noun-phrase label."""
     target = str(target_label or '').strip().lower()
     if not target:
         return ''
-    if _SAM_PROMPT_SIMPLE:
-        return target
-    element = str(interactive_element or '').strip().lower()
-    parent = str(parent_object or '').strip().lower()
-    role = str(role or 'object').strip().lower()
-
-    target_phrase = _interaction_target_phrase(target, element, role)
-    clauses = []
-    if role == 'element':
-        if active:
-            if parent and parent != target:
-                clauses.append(f"the {target} being touched and used to manipulate the {parent}")
-            else:
-                clauses.append(f"the {target} being directly touched and interacted with")
-        else:
-            if parent and parent != target:
-                clauses.append(f"the {target} on the {parent} that is about to be used for interaction")
-            else:
-                clauses.append(f"the {target} that is about to be used for interaction")
-        if parent and parent != target:
-            clauses.append(f"not the surrounding {parent}")
-        clauses.append("not the hand")
-        clauses.append("not the background")
-    else:
-        if active:
-            if element and element != target:
-                clauses.append(f"the {target_phrase} being directly manipulated through the {element}")
-            else:
-                clauses.append(f"the {target_phrase} being directly interacted with by the hand")
-            focus = _interaction_focus_clause(target, element, role)
-            if focus:
-                clauses.append(focus)
-        else:
-            if element and element != target:
-                clauses.append(f"the {target_phrase} associated with the {element} that will be interacted with")
-                focus = _interaction_focus_clause(target, element, role)
-                if focus:
-                    clauses.append(focus)
-            else:
-                clauses.append(f"the {target_phrase} that will be interacted with")
-        clauses.append("not the hand")
-        clauses.append("not the surrounding background")
-
-    return '; '.join(clause for clause in clauses if clause)
+    return target
 
 
 def run_sam3_prompt_specs(
@@ -988,11 +1178,19 @@ def run_sam3_prompt_specs(
             if isinstance(outputs, dict) and "out_binary_masks" in outputs:
                 masks_arr = outputs.get("out_binary_masks")
                 probs_arr = outputs.get("out_probs", None)
+                # Per-frame SAM2 propagation score (genuine per-frame mask
+                # quality). out_probs is only the constant first-frame DETECTION
+                # score; out_sam2_probs varies frame-to-frame and is the real
+                # propagation confidence (0 on the seed frame, where we fall back
+                # to out_probs).
+                sam2_probs_arr = outputs.get("out_sam2_probs", None)
                 boxes_arr = outputs.get("out_boxes_xywh", None)
                 if isinstance(masks_arr, torch.Tensor):
                     masks_arr = masks_arr.detach().cpu().numpy()
                 if isinstance(probs_arr, torch.Tensor):
                     probs_arr = probs_arr.detach().cpu().numpy()
+                if isinstance(sam2_probs_arr, torch.Tensor):
+                    sam2_probs_arr = sam2_probs_arr.detach().cpu().numpy()
                 if isinstance(boxes_arr, torch.Tensor):
                     boxes_arr = boxes_arr.detach().cpu().numpy()
                 boxes_np = None
@@ -1009,12 +1207,26 @@ def run_sam3_prompt_specs(
                     mask = _normalize_mask(masks_arr[obj_idx])
                     if mask is None:
                         continue
-                    store[frame_index] |= mask
-                    prob = np.nan
+                    # Prefer the per-frame SAM2 propagation score; fall back to
+                    # the (constant) first-frame detection score on the seed
+                    # frame, where the SAM2 score is 0/absent.
+                    det_prob = np.nan
                     if probs_arr is not None:
                         probs_np = np.asarray(probs_arr).reshape(-1)
                         if obj_idx < len(probs_np):
-                            prob = float(probs_np[obj_idx])
+                            det_prob = float(probs_np[obj_idx])
+                    sam2_prob = np.nan
+                    if sam2_probs_arr is not None:
+                        sam2_np = np.asarray(sam2_probs_arr).reshape(-1)
+                        if obj_idx < len(sam2_np):
+                            sam2_prob = float(sam2_np[obj_idx])
+                    prob = sam2_prob if (np.isfinite(sam2_prob) and sam2_prob > 0.0) else det_prob
+                    # Hard score gate: when SAM3's own probability is below the
+                    # threshold, DROP this frame's mask (absent/ambiguous object ->
+                    # empty, not "random stuff"). NaN (no score) is kept as legacy.
+                    if SAM3_RAW_SCORE_MIN > 0.0 and np.isfinite(prob) and prob < float(SAM3_RAW_SCORE_MIN):
+                        continue
+                    store[frame_index] |= mask
                     should_update_box = (
                         box_store is not None
                         and boxes_np is not None
@@ -1142,5 +1354,3 @@ def build_exclusive_object_masks(
             exclusive = _nearest_component(exclusive.astype(np.uint8), elem)
         exclusive_masks.append(exclusive.astype(bool))
     return exclusive_masks
-
-

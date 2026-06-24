@@ -78,8 +78,23 @@ def run_artipoint_articulation_update(
     D_color: Optional[np.ndarray] = None,
     debug_dir: Optional[Path] = None,
     object_prompt_boxes: Optional[Sequence[Optional[Sequence[float]]]] = None,
+    pose_estimation: str = "articulation",
+    secondary_query_masks: Optional[Sequence[np.ndarray]] = None,
+    hand_masks: Optional[Sequence[np.ndarray]] = None,
 ) -> Tuple[Optional[dict], dict]:
-    """Direct Artipoint-style articulation path for 1-DoF moving parts."""
+    """Direct Artipoint-style articulation path for 1-DoF moving parts.
+
+    ``pose_estimation`` selects how the CoTracker3 mask tracks are turned into a
+    pose history:
+
+      * ``"articulation"`` (default) — lift tracks to 3D, per-frame Kabsch, then
+        fit a 1-DoF joint. For genuinely articulated parts (doors/drawers).
+      * ``"rigid_pnp"`` — a free RIGID object carried as one body (spoon/mug).
+        Seed CoTracker3 on the SAM3 active mask at a SINGLE frame, then solve a
+        per-frame ``cv2.solvePnPRansac`` (LostFound math) to recover the 6-DoF
+        rigid pose. No joint is fit. Single-frame seeding is required so every
+        3D query lives in one consistent object frame for PnP.
+    """
     points = np.asarray(initial_points, dtype=np.float32)
     colors = np.asarray(initial_colors, dtype=np.float32)
     debug = {
@@ -108,10 +123,12 @@ def run_artipoint_articulation_update(
         debug["failure_reason"] = "missing_rgb_depth_or_pose"
         return None, debug
 
-    # Active object-mask keypoint seeding: use the propagated SAM3 object mask
-    # on active frames, then detect Shi-Tomasi corners inside those masks.
-    # This restores the active-clip frontend while forcing the query source to
-    # always be the object / moving-part mask rather than the element mask.
+    # Active semantic-mask keypoint seeding: use the propagated SAM3 masks on
+    # active frames, then detect Shi-Tomasi corners inside those masks. The
+    # primary mask is the moving object/body and an optional secondary mask can
+    # contribute extra corners from the interactive element (e.g. handle) so
+    # one shared-motion fit can be driven by both regions while geometry stays
+    # separate downstream.
     def _artipoint_sample_hand_position(sample_index: int) -> Optional[np.ndarray]:
         sample = clip.samples[int(sample_index)]
         preferred = getattr(clip, "interaction_hand", None)
@@ -131,13 +148,19 @@ def run_artipoint_articulation_update(
         debug["failure_reason"] = "active_clip_too_short"
         return None, debug
     candidate_keyframes = list(range(n_video_frames))
+    all_candidate_keyframes = list(candidate_keyframes)
+
+    def _frame_mask_area(masks_seq, frame_idx: int) -> int:
+        if masks_seq is None or frame_idx >= len(masks_seq):
+            return 0
+        return int(np.count_nonzero(np.asarray(masks_seq[frame_idx], dtype=bool)))
 
     def _masks_usable(masks_seq) -> bool:
         if masks_seq is None:
             return False
         if len(masks_seq) < max(candidate_keyframes) + 1:
             return False
-        return any(int(np.count_nonzero(np.asarray(m, dtype=bool))) >= 16 for m in masks_seq)
+        return any(_frame_mask_area(masks_seq, idx) >= 16 for idx in range(len(candidate_keyframes)))
 
     if not _masks_usable(active_query_masks):
         debug["failure_reason"] = "missing_active_query_masks"
@@ -157,11 +180,16 @@ def run_artipoint_articulation_update(
     # frame, which is also what the active rest-pose surface anchor expects.
     usable_keyframes = [
         kf for kf in candidate_keyframes
-        if kf < len(active_query_masks)
-        and int(np.count_nonzero(np.asarray(active_query_masks[kf], dtype=bool))) >= 16
+        if max(_frame_mask_area(active_query_masks, kf), _frame_mask_area(secondary_query_masks, kf)) >= 16
     ]
     n_dropped_keyframes = len(candidate_keyframes) - len(usable_keyframes)
     candidate_keyframes = usable_keyframes
+    # rigid_pnp solves PnP against ONE consistent object frame, so all 3D queries
+    # must be lifted in a single seed frame (the first usable active frame). Keep
+    # only that frame for seeding; CoTracker3 (backward_tracking=True) still
+    # propagates those queries across the whole clip.
+    if pose_estimation == "rigid_pnp" and candidate_keyframes and not RIGID_RESEED_EVERY_FRAME:
+        candidate_keyframes = [candidate_keyframes[0]]
     debug["seeding_keyframe_count"] = int(len(candidate_keyframes))
     debug["dropped_empty_mask_keyframes"] = int(n_dropped_keyframes)
     if n_dropped_keyframes:
@@ -170,9 +198,17 @@ def run_artipoint_articulation_update(
             f"frame(s) with empty/too-small object masks; seeding from "
             f"{len(candidate_keyframes)} usable frame(s)."
         )
+    # NOTE: per-seed-keyframe corner overlays (the `<label>_keypoints/` folder)
+    # are intentionally NOT written. They showed every SEEDED corner on the
+    # sparse usable seed frames (e.g. drawer frames 0-3, 40-41), which read as a
+    # misleading "jump" and included corners that were later filtered out. The
+    # effective debug — only the tracks that survived filtering, overlaid on
+    # every frame with their masks — is written by _save_artipoint_tracks_imagery
+    # below (the `<label>_tracks/` folder).
 
     debug["tracking_point_count"] = int(len(points))
     debug["query_mask_frame_count"] = int(len(active_query_masks)) if active_query_masks is not None else 0
+    debug["secondary_query_mask_frame_count"] = int(len(secondary_query_masks)) if secondary_query_masks is not None else 0
 
     # Build native depth-camera world-position lookups on demand. Materials
     # needed: depth_raw_list + depth_grid + K_depth + T_cam_depth + T_cam_color
@@ -231,42 +267,99 @@ def run_artipoint_articulation_update(
     )
 
     per_keyframe_query_counts: List[int] = []
+    per_keyframe_primary_query_counts: List[int] = []
+    per_keyframe_secondary_query_counts: List[int] = []
     all_queries_2d_list: List[np.ndarray] = []
     all_queries_world_list: List[np.ndarray] = []
     for kf_idx in candidate_keyframes:
-        explicit_mask = np.asarray(active_query_masks[kf_idx], dtype=bool)
         world_lookup_kf = world_lookups[kf_idx] if using_native_lift else None
-        queries_2d_kf, queries_world_kf = detect_corner_queries_in_image(
-            points,
-            rgb_list[kf_idx],
-            clip_depths[kf_idx],
-            T_wc_list[kf_idx],
-            K_color,
-            T_cam_color,
-            max_corners=int(ARTIPOINT_MAX_CORNERS_PER_KEYFRAME),
-            hand_world=_artipoint_sample_hand_position(kf_idx),
-            explicit_mask=explicit_mask,
-            world_lookup=world_lookup_kf,
+        queries_2d_blocks: List[np.ndarray] = []
+        queries_world_blocks: List[np.ndarray] = []
+        primary_count = 0
+        secondary_count = 0
+        # ArtiPoint tracks the MOVING PART ONLY, never the hand. SAM's door/handle
+        # masks leak onto the gripping hand (the hand sits on the handle), and
+        # goodFeaturesToTrack then prefers the textured hand/skin over the
+        # textureless door — those corners follow the hand and corrupt the screw
+        # fit (revolute/prismatic confusion, off pivot, 0.1-0.3 m residuals). So
+        # subtract the (dilated) per-frame hand mask from BOTH query masks before
+        # seeding corners.
+        _hand_mask_kf = (
+            np.asarray(hand_masks[kf_idx], dtype=bool)
+            if hand_masks is not None and kf_idx < len(hand_masks) and hand_masks[kf_idx] is not None
+            else None
         )
-        if debug_dir is not None:
-            try:
-                _save_artipoint_keypoints_imagery(
-                    debug_dir,
-                    kf_idx,
-                    rgb_list[kf_idx],
-                    queries_2d_kf,
-                    label,
-                    active_mask=explicit_mask,
-                    prompt_box=(
-                        object_prompt_boxes[kf_idx]
-                        if object_prompt_boxes is not None and kf_idx < len(object_prompt_boxes)
-                        else None
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[ArtiPoint-Debug] keypoint overlay save failed: {exc}")
+        if _hand_mask_kf is not None and np.any(_hand_mask_kf):
+            _hand_dilated = cv2.dilate(
+                _hand_mask_kf.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ARTIPOINT_HAND_EXCLUSION_DILATE, ARTIPOINT_HAND_EXCLUSION_DILATE)),
+            ).astype(bool)
+        else:
+            _hand_dilated = None
+        primary_mask = (
+            np.asarray(active_query_masks[kf_idx], dtype=bool)
+            if active_query_masks is not None and kf_idx < len(active_query_masks)
+            else np.zeros(rgb_list[kf_idx].shape[:2], dtype=bool)
+        )
+        if _hand_dilated is not None:
+            primary_mask = primary_mask & ~_hand_dilated
+        if int(np.count_nonzero(primary_mask)) >= 16:
+            q2d_primary, qworld_primary = detect_corner_queries_in_image(
+                points,
+                rgb_list[kf_idx],
+                clip_depths[kf_idx],
+                T_wc_list[kf_idx],
+                K_color,
+                T_cam_color,
+                max_corners=int(ARTIPOINT_MAX_CORNERS_PER_KEYFRAME),
+                hand_world=_artipoint_sample_hand_position(kf_idx),
+                explicit_mask=primary_mask,
+                world_lookup=world_lookup_kf,
+            )
+            primary_count = int(len(q2d_primary))
+            if primary_count:
+                queries_2d_blocks.append(np.asarray(q2d_primary, dtype=np.float32))
+                queries_world_blocks.append(np.asarray(qworld_primary, dtype=np.float32))
+        secondary_mask = (
+            np.asarray(secondary_query_masks[kf_idx], dtype=bool)
+            if secondary_query_masks is not None and kf_idx < len(secondary_query_masks)
+            else None
+        )
+        if secondary_mask is not None and _hand_dilated is not None:
+            secondary_mask = secondary_mask & ~_hand_dilated
+        if secondary_mask is not None and int(np.count_nonzero(secondary_mask)) >= 16:
+            q2d_secondary, qworld_secondary = detect_corner_queries_in_image(
+                points,
+                rgb_list[kf_idx],
+                clip_depths[kf_idx],
+                T_wc_list[kf_idx],
+                K_color,
+                T_cam_color,
+                max_corners=int(ARTIPOINT_MAX_CORNERS_PER_KEYFRAME),
+                hand_world=_artipoint_sample_hand_position(kf_idx),
+                explicit_mask=secondary_mask,
+                world_lookup=world_lookup_kf,
+            )
+            secondary_count = int(len(q2d_secondary))
+            if secondary_count:
+                queries_2d_blocks.append(np.asarray(q2d_secondary, dtype=np.float32))
+                queries_world_blocks.append(np.asarray(qworld_secondary, dtype=np.float32))
+        if queries_2d_blocks:
+            queries_2d_kf = np.concatenate(queries_2d_blocks, axis=0).astype(np.float32)
+            queries_world_kf = np.concatenate(queries_world_blocks, axis=0).astype(np.float32)
+            if len(queries_2d_kf) > 1:
+                rounded_xy = np.round(queries_2d_kf[:, 1:3]).astype(np.int32)
+                _uniq, keep_idx = np.unique(rounded_xy, axis=0, return_index=True)
+                keep_idx = np.sort(keep_idx.astype(np.int32))
+                queries_2d_kf = queries_2d_kf[keep_idx]
+                queries_world_kf = queries_world_kf[keep_idx]
+        else:
+            queries_2d_kf = np.zeros((0, 3), dtype=np.float32)
+            queries_world_kf = np.zeros((0, 3), dtype=np.float32)
         n_kf = int(len(queries_2d_kf))
         per_keyframe_query_counts.append(n_kf)
+        per_keyframe_primary_query_counts.append(int(primary_count))
+        per_keyframe_secondary_query_counts.append(int(secondary_count))
         if n_kf == 0:
             continue
         queries_2d_kf = np.asarray(queries_2d_kf, dtype=np.float32).copy()
@@ -276,14 +369,16 @@ def run_artipoint_articulation_update(
 
     best_start_idx = int(candidate_keyframes[0]) if candidate_keyframes else 0
     keyframe_indices = list(candidate_keyframes)
-    debug["query_source"] = "goodFeaturesToTrack@image[multi_keyframe+active_object_sam3]"
+    debug["query_source"] = "goodFeaturesToTrack@image[multi_keyframe+active_semantic_masks]"
     debug["keyframe_indices"] = [int(k) for k in keyframe_indices]
     debug["per_keyframe_query_counts"] = per_keyframe_query_counts
+    debug["per_keyframe_primary_query_counts"] = per_keyframe_primary_query_counts
+    debug["per_keyframe_secondary_query_counts"] = per_keyframe_secondary_query_counts
     if not all_queries_2d_list:
         debug["projected_query_count"] = 0
         debug["failure_reason"] = "too_few_corner_queries"
         print(
-            f"[ArtiPoint-Articulation][Error] no valid corners extracted from active object masks for '{label}'."
+            f"[ArtiPoint-Articulation][Error] no valid corners extracted from active semantic masks for '{label}'."
         )
         return None, debug
     best_queries = np.concatenate(all_queries_2d_list, axis=0).astype(np.float32)
@@ -297,12 +392,12 @@ def run_artipoint_articulation_update(
     if len(best_queries) < ARTIPOINT_MIN_VISIBLE_POINTS:
         debug["failure_reason"] = "too_few_corner_queries"
         print(
-            f"[ArtiPoint-Articulation][Error] only {len(best_queries)} corners survived from active object masks for '{label}' "
+            f"[ArtiPoint-Articulation][Error] only {len(best_queries)} corners survived from active semantic masks for '{label}' "
             f"(need >= {ARTIPOINT_MIN_VISIBLE_POINTS})."
         )
         return None, debug
     print(
-        f"[ArtiPoint-Queries] seeded {len(best_queries)} active object-mask corners across "
+        f"[ArtiPoint-Queries] seeded {len(best_queries)} active semantic-mask corners across "
         f"{len(keyframe_indices)} active frames "
         f"(max_feat_points={ARTIPOINT_MAX_CORNERS_PER_KEYFRAME}, "
         f"max_queries={ARTIPOINT_MAX_TOTAL_QUERIES})"
@@ -324,20 +419,56 @@ def run_artipoint_articulation_update(
             f"{free_before/2**30:.2f} GiB / total {total/2**30:.2f} GiB, "
             f"video frames={len(rgb_list)} @ {rgb_list[0].shape}"
         )
-        # Always CoTracker3, always offline (per user requirement). v2=False
-        # selects CoTrackerThreeOffline in build_cotracker; offline=True
-        # disables the streaming/online window.
-        tracker = CoTracker3Predictor(
-            checkpoint=str(checkpoint_path),
-            v2=False,
-            offline=True,
-        ).to("cuda")
-        video = torch.from_numpy(np.stack(rgb_list).astype(np.float32)).permute(0, 3, 1, 2)[None].to("cuda")
-        queries_tensor = torch.from_numpy(best_queries)[None].to("cuda")
-        with torch.inference_mode():
-            pred_tracks, pred_visibility = tracker(video, queries=queries_tensor, backward_tracking=True)
+        # ONLINE / streaming CoTracker3. The model processes the clip through a
+        # sliding window (window_len frames), so GPU memory is CONSTANT — bounded by
+        # the window, NOT by the clip length. A 110-frame clip costs the same as a
+        # 30-frame one, so long clips no longer OOM (no striding, no resolution drop),
+        # and it matches LostFound's streaming tracker. Causal (no backward pass);
+        # for rigid transport that is fine because translation rides on the hand and
+        # only rotation comes from the tracks.
+        online_ckpt = _cotracker3_checkpoint(online=True) or checkpoint_path
+        tracker = CoTrackerOnlinePredictor(checkpoint=str(online_ckpt), window_len=16).to("cuda")
+        src_h, src_w = rgb_list[0].shape[:2]
+        track_scale = 1.0
+        debug["cotracker_track_scale"] = float(track_scale)
+        debug["cotracker_mode"] = "online_streaming"
+        scaled_queries = np.asarray(best_queries, dtype=np.float32)
+        step = int(tracker.step)
+        print(
+            f"[ArtiPoint-CoTracker] ONLINE streaming tracking at {src_w}x{src_h} across "
+            f"{len(rgb_list)} frame(s), window={2 * step} (constant GPU memory, no OOM on long clips)."
+        )
+        queries_tensor = torch.from_numpy(np.ascontiguousarray(scaled_queries))[None].to("cuda")
+        n_rgb = len(rgb_list)
+        window_frames: List[np.ndarray] = []
+        is_first_step = True
+        for i in range(n_rgb):
+            if i % step == 0 and i != 0:
+                pt, pv = lostfound_process_step(tracker, window_frames, is_first_step, queries_tensor)
+                is_first_step = False
+                if pt is not None:
+                    pred_tracks, pred_visibility = pt, pv
+            window_frames.append(np.asarray(rgb_list[i], dtype=np.float32))
+        # Final (partial) window so the remaining frames are covered.
+        pt, pv = lostfound_process_step(
+            tracker,
+            window_frames[-((n_rgb - 1) % step) - step - 1 :],
+            is_first_step,
+            queries_tensor,
+        )
+        if pt is not None:
+            pred_tracks, pred_visibility = pt, pv
+        if pred_tracks is None or pred_visibility is None:
+            debug["failure_reason"] = "cotracker_online_no_output"
+            return None, debug
         tracks_np = pred_tracks.squeeze(0).detach().cpu().numpy().astype(np.float32)
         visibility_np = pred_visibility.squeeze(0).detach().cpu().numpy().astype(bool)
+        # Online tracks may run a few frames short of the clip length; align to the
+        # shorter length so downstream per-frame indexing (T_wc_list, clip.samples)
+        # stays consistent.
+        n_track = int(tracks_np.shape[0])
+        if n_track != n_rgb:
+            debug["cotracker_online_frame_mismatch"] = [n_track, n_rgb]
     except Exception as exc:  # noqa: BLE001
         debug["failure_reason"] = f"cotracker_failed:{exc}"
         return None, debug
@@ -350,6 +481,70 @@ def run_artipoint_articulation_update(
         del pred_visibility
         torch.cuda.empty_cache()
         gc.collect()
+
+    # Rigid-transport objects (spoon/mug/bottle) follow LostFound's tracking model:
+    # ROTATION from per-frame PnP on the tracked corners, but TRANSLATION anchored to
+    # the grasping HAND (the object is rigidly attached to the hand during a grasp).
+    # This is far more robust for thin/occluded carried objects than deriving
+    # translation from the corner tracks themselves: even when the corners are sparse
+    # or PnP rotation is noisy, the object still follows the hand instead of drifting
+    # away (the spoon "falling" while the hand rises). No joint is fit.
+    if pose_estimation in ("rigid_pnp", "rigid_3d"):
+        # Lift the (now multi-keyframe-seeded) corner tracks to world so the rigid
+        # rotation can be solved by incremental consecutive-frame Kabsch, which
+        # tolerates corners dying and fresh ones being re-seeded mid-clip.
+        rigid_tracks_world = rigid_tracks_valid = None
+        if RIGID_RESEED_EVERY_FRAME:
+            try:
+                rigid_tracks_world, rigid_tracks_valid = lift_cotracker_tracks_to_world(
+                    tracks_np,
+                    visibility_np,
+                    clip_depths,
+                    rgb_list,
+                    T_wc_list,
+                    K_color,
+                    T_cam_color,
+                    world_lookups=world_lookups,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[RigidPnP] world-track lift failed ({exc}); falling back to single-seed PnP rotation.")
+                rigid_tracks_world = rigid_tracks_valid = None
+        # Debug dump: world-lifted rigid tracks so visualize_tracks.py can replay
+        # the TRUE 3D trajectory and drop static background tracks (see the
+        # articulation-path dump below for the same payload shape).
+        if debug_dir is not None and rigid_tracks_world is not None and rigid_tracks_valid is not None:
+            try:
+                track_dir = Path(debug_dir) / f"{label}_tracks"
+                track_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    track_dir / "world_tracks.npz",
+                    tracks_world=np.asarray(rigid_tracks_world, dtype=np.float32),
+                    tracks_world_smoothed=np.asarray(rigid_tracks_world, dtype=np.float32),
+                    valid=np.asarray(rigid_tracks_valid, dtype=bool),
+                    label=str(label),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[RigidPnP-Debug] world-track npz dump failed: {exc}")
+        return _rigid_pnp_pose_history(
+            clip,
+            label,
+            points,
+            colors,
+            best_queries_world,
+            tracks_np,
+            visibility_np,
+            int(best_start_idx),
+            rgb_list,
+            T_wc_list,
+            K_color,
+            T_cam_color,
+            debug,
+            debug_dir=debug_dir,
+            active_masks=active_query_masks,
+            interaction_hand=getattr(clip, "interaction_hand", None),
+            tracks_world=rigid_tracks_world,
+            tracks_world_valid=rigid_tracks_valid,
+        )
 
     tracks_world, valid_tracks = lift_cotracker_tracks_to_world(
         tracks_np,
@@ -376,6 +571,8 @@ def run_artipoint_articulation_update(
     try:
         surf_frame = int(best_start_idx)
         surf_mask = np.asarray(active_query_masks[surf_frame], dtype=bool)
+        if secondary_query_masks is not None and surf_frame < len(secondary_query_masks):
+            surf_mask = surf_mask | np.asarray(secondary_query_masks[surf_frame], dtype=bool)
         active_surface_points: Optional[np.ndarray] = None
         if using_native_lift:
             surf_lut = world_lookups[surf_frame]
@@ -408,6 +605,13 @@ def run_artipoint_articulation_update(
         valid_tracks,
         query_points_world=prefilter_query_points_world,
         prior_surface_points=surface_anchor_points,
+        # Rigid transport moves the object far from its prior/seed surface by
+        # design, so don't gate its tracks on surface proximity. ArtiPoint-literal
+        # mode also drops this (non-ArtiPoint) gate for articulated objects.
+        apply_prior_surface_filter=(
+            pose_estimation not in ("rigid_pnp", "rigid_3d")
+            and not ARTIPOINT_LITERAL_FILTERS
+        ),
     )
     best_queries_world = best_queries_world[kept_track_mask]
     print(
@@ -423,6 +627,7 @@ def run_artipoint_articulation_update(
                 visibility_np[:, kept_track_mask],
                 label,
                 active_masks=active_query_masks,
+                element_masks=secondary_query_masks,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[ArtiPoint-Debug] filtered track overlay save failed: {exc}")
@@ -443,6 +648,22 @@ def run_artipoint_articulation_update(
         "lambda_jerk": float(ARTIPOINT_TRACK_SMOOTH_LAMBDA_JERK),
         "applied": True,
     }
+    # Debug dump: world-lifted tracks (T,N,3) + validity, so an offline viewer
+    # can replay the TRUE 3D trajectories and split moving (object) tracks from
+    # static (background) ones by world displacement. See temp/visualize_tracks.py.
+    if debug_dir is not None:
+        try:
+            track_dir = Path(debug_dir) / f"{label}_tracks"
+            track_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                track_dir / "world_tracks.npz",
+                tracks_world=np.asarray(tracks_world, dtype=np.float32),
+                tracks_world_smoothed=np.asarray(tracks_world_smoothed, dtype=np.float32),
+                valid=np.asarray(valid_tracks, dtype=bool),
+                label=str(label),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ArtiPoint-Debug] world-track npz dump failed: {exc}")
     reference_points_world = np.asarray(best_queries_world, dtype=np.float32)
     if (
         0 <= int(best_start_idx) < tracks_world_smoothed.shape[0]
@@ -467,6 +688,9 @@ def run_artipoint_articulation_update(
         debug["failure_reason"] = "insufficient_surface_pose_updates"
         debug["pose_updates"] = int(len(raw_history))
         return None, debug
+
+    # (Rigid transport already returned above via _rigid_pnp_pose_history — PnP
+    # rotation + hand-anchored translation. Everything below is the articulated path.)
 
     # Collect wrist positions per pose-history frame for the wrist-derived
     # theta path. The wrist is on the handle, so it traces a circular arc
@@ -577,6 +801,285 @@ def run_artipoint_articulation_update(
         "corner_track_frames": track_frames_timeline,
     }
     _copy_articulation_fields_from_fit(result, fit)
+    return result, debug
+
+
+def _rigid_pnp_pose_history(
+    clip: ClipInfo,
+    label: str,
+    points: np.ndarray,
+    colors: np.ndarray,
+    queries_world: np.ndarray,
+    tracks_np: np.ndarray,
+    visibility_np: np.ndarray,
+    seed_frame_idx: int,
+    rgb_list: Sequence[np.ndarray],
+    T_wc_list: Sequence[np.ndarray],
+    K_color: np.ndarray,
+    T_cam_color: np.ndarray,
+    debug: dict,
+    debug_dir: Optional[Path] = None,
+    active_masks: Optional[Sequence[np.ndarray]] = None,
+    interaction_hand: Optional[str] = None,
+    tracks_world: Optional[np.ndarray] = None,
+    tracks_world_valid: Optional[np.ndarray] = None,
+) -> Tuple[Optional[dict], dict]:
+    """LostFound rigid-transport tracking: PnP ROTATION + HAND-anchored TRANSLATION.
+
+    A free rigid object (spoon/mug/bottle) carried as one body. ``queries_world``
+    (N,3) are the world positions of the corners seeded inside the SAM3 active mask
+    at the seed frame. We define the object frame at the prior-cloud centroid
+    ``c_seed`` and fix the grasp offset ``delta_obj = hand_seed - c_seed`` (the hand
+    is rigidly attached to the object). Then for each frame:
+
+      * ROTATION: ``solvePnPRansac(object 3D, tracked 2D)`` -> object->camera, lifted
+        to world ``R_world = R_cam2world @ R_obj_cam``.
+      * TRANSLATION: anchored to the hand, ``t_world = hand_t - R_world @ delta_obj``
+        (object follows the hand). Falls back to the PnP translation only when no
+        hand position is available.
+
+    This is LostFound's model: the corners only need to supply rotation; translation
+    rides on the robustly tracked hand, so a thin/occluded object follows the hand
+    instead of drifting (fixes the spoon "falling"). No joint is fit.
+    """
+    debug["tracker"] = "rigid_lostfound_hand"
+    points_arr = np.asarray(points, dtype=np.float64)
+    queries_world = np.asarray(queries_world, dtype=np.float64)
+    c_seed = points_arr.mean(axis=0) if len(points_arr) else queries_world.mean(axis=0)
+    # Object frame is world-oriented (R_seed = I) and centred at c_seed.
+    queries_object = queries_world - c_seed
+    n_frames = int(tracks_np.shape[0])
+    n_queries = int(tracks_np.shape[1])
+    K = np.asarray(K_color, dtype=np.float64)
+    dist = np.zeros((5, 1), dtype=np.float64)
+
+    def _hand_world(frame_idx: int) -> Optional[np.ndarray]:
+        if frame_idx >= len(clip.samples):
+            return None
+        sample = clip.samples[frame_idx]
+        keys: List[str] = []
+        if interaction_hand in ("left", "right"):
+            keys += [f"{interaction_hand}_hand_world_wrist", f"{interaction_hand}_hand_world"]
+        keys += ["right_hand_world_wrist", "left_hand_world_wrist", "right_hand_world", "left_hand_world"]
+        for key in keys:
+            value = sample.get(key)
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=np.float64).reshape(-1)
+            if arr.size == 3 and np.all(np.isfinite(arr)):
+                return arr
+        return None
+
+    hand_seed = _hand_world(int(seed_frame_idx))
+    delta_obj = (hand_seed - c_seed) if hand_seed is not None else None
+    debug["hand_anchor_available"] = bool(delta_obj is not None)
+
+    def _pnp_rotation_world(frame_idx: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Object->world ROTATION (and the PnP tvec) from this frame's tracks, or None."""
+        vis = np.asarray(visibility_np[frame_idx], dtype=bool)
+        # LostFound solves PnP on whatever points are visible; use a low floor so a
+        # fresh rotation is recovered almost every frame (not the 32-point geometry
+        # floor used by the articulated Kabsch path).
+        if int(np.count_nonzero(vis)) < RIGID_PNP_MIN_VISIBLE_POINTS:
+            return None
+        obj3d = queries_object[vis]
+        img2d = np.asarray(tracks_np[frame_idx], dtype=np.float64)[vis]
+        if len(obj3d) < 4:
+            return None
+        try:
+            ok, rvec, tvec, _ = cv2.solvePnPRansac(obj3d, img2d, K, dist)
+        except cv2.error:
+            return None
+        if not ok:
+            return None
+        rot, _ = cv2.Rodrigues(rvec)
+        world_from_color = (
+            np.asarray(T_wc_list[frame_idx], dtype=np.float64)
+            @ np.asarray(T_cam_color, dtype=np.float64)
+        )
+        return world_from_color[:3, :3] @ rot, np.asarray(tvec, dtype=np.float64).reshape(3)
+
+    def _kabsch_rotation(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
+        """Closed-form rotation R with (Q - Qc) ~= R @ (P - Pc) (Kabsch/Umeyama)."""
+        Pc = P.mean(axis=0)
+        Qc = Q.mean(axis=0)
+        H = (P - Pc).T @ (Q - Qc)
+        U, _S, Vt = np.linalg.svd(H)
+        d = np.sign(np.linalg.det(Vt.T @ U.T))
+        D = np.diag([1.0, 1.0, float(d)])
+        return Vt.T @ D @ U.T
+
+    # Re-seed-friendly rotation: with corners seeded on EVERY active frame, the
+    # 2D-3D PnP model (a single seed-frame snapshot) is no longer consistent, so we
+    # drive rotation from INCREMENTAL consecutive-frame Kabsch on the world-lifted
+    # tracks. R_world(seed)=I (object frame is world-oriented at c_seed), and each
+    # step R(t)=R_rel(t-1->t) @ R(t-1) accumulates from whatever corners are shared
+    # by two adjacent frames — so freshly re-seeded corners contribute immediately
+    # and dying ones simply drop out, instead of freezing the orientation.
+    kabsch_R: Optional[Dict[int, np.ndarray]] = None
+    W = V = None
+    if (
+        tracks_world is not None
+        and tracks_world_valid is not None
+        and RIGID_RESEED_EVERY_FRAME
+    ):
+        W = np.asarray(tracks_world, dtype=np.float64)
+        V = np.asarray(tracks_world_valid, dtype=bool)
+        if W.ndim == 3 and W.shape[0] == n_frames and W.shape[1] == n_queries:
+            V = V & np.all(np.isfinite(W), axis=2)
+            kabsch_R = {int(seed_frame_idx): np.eye(3)}
+            R_run = np.eye(3)
+            for t in range(int(seed_frame_idx) + 1, n_frames):
+                common = V[t - 1] & V[t]
+                if int(np.count_nonzero(common)) >= RIGID_KABSCH_MIN_PAIRS:
+                    R_run = _kabsch_rotation(W[t - 1][common], W[t][common]) @ R_run
+                kabsch_R[t] = R_run.copy()
+            R_run = np.eye(3)
+            for t in range(int(seed_frame_idx) - 1, -1, -1):
+                common = V[t] & V[t + 1]
+                if int(np.count_nonzero(common)) >= RIGID_KABSCH_MIN_PAIRS:
+                    R_run = _kabsch_rotation(W[t + 1][common], W[t][common]) @ R_run
+                kabsch_R[t] = R_run.copy()
+        else:
+            kabsch_R = None
+    debug["rigid_rotation_method"] = "incremental_kabsch" if kabsch_R is not None else "pnp"
+
+    # CONTINUOUS tracking: emit a pose for EVERY frame of the interaction, not only
+    # the frames where rotation solves. Translation always follows the HAND (robust);
+    # ROTATION comes from Kabsch/PnP when corners are available and is CARRIED FORWARD
+    # (held at the last good value) when they are not. So the object keeps moving
+    # with the hand for the whole active clip instead of freezing after the seed.
+    poses_world: Dict[int, np.ndarray] = {}
+    last_R_world: Optional[np.ndarray] = None
+    n_pnp_solved = 0
+    for t in range(n_frames):
+        rot_res = None
+        if kabsch_R is not None:
+            R_fresh = kabsch_R.get(t)
+            if R_fresh is not None:
+                last_R_world = (
+                    np.asarray(R_fresh, dtype=np.float64)
+                    if last_R_world is None
+                    else np.asarray(
+                        slerp_rotation_step(last_R_world, R_fresh, LOSTFOUND_ROTATION_SLERP_ALPHA),
+                        dtype=np.float64,
+                    )
+                )
+                n_pnp_solved += 1
+        else:
+            rot_res = _pnp_rotation_world(t)
+            if rot_res is not None:
+                # LostFound-style SLERP EMA on the rotation: blend the fresh PnP rotation
+                # toward the previous one to damp per-frame PnP jitter on thin objects.
+                last_R_world = np.asarray(
+                    slerp_rotation_step(last_R_world, rot_res[0], LOSTFOUND_ROTATION_SLERP_ALPHA),
+                    dtype=np.float64,
+                )
+                n_pnp_solved += 1
+        R_world = last_R_world
+        hand_t = _hand_world(t)
+        if delta_obj is not None and hand_t is not None and R_world is not None:
+            # Hand-anchored translation + (PnP-or-carried) rotation.
+            t_world = hand_t - R_world @ delta_obj
+        elif rot_res is not None:
+            # No hand: full PnP pose for this frame only.
+            world_from_color = (
+                np.asarray(T_wc_list[t], dtype=np.float64) @ np.asarray(T_cam_color, dtype=np.float64)
+            )
+            obj_cam = np.eye(4, dtype=np.float64)
+            obj_cam[:3, :3] = world_from_color[:3, :3].T @ R_world
+            obj_cam[:3, 3] = rot_res[1]
+            t_world = (world_from_color @ obj_cam)[:3, 3]
+        elif kabsch_R is not None and R_world is not None and W is not None and V is not None and bool(V[t].any()):
+            # No hand, Kabsch path: translate to the visible world-track centroid.
+            t_world = W[t][V[t]].mean(axis=0)
+        else:
+            # Neither hand nor a usable rotation yet — skip until tracking starts.
+            continue
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = R_world
+        pose[:3, 3] = t_world
+        poses_world[t] = pose
+    debug["pnp_solved_frames"] = int(n_pnp_solved)
+    if len(poses_world) < LOSTFOUND_MIN_UPDATES:
+        debug["failure_reason"] = "rigid_pnp_too_few_pose_updates"
+        debug["pose_updates"] = int(len(poses_world))
+        print(
+            f"[RigidPnP][Error] '{label}': only {len(poses_world)} solvable PnP frames "
+            f"(need >= {LOSTFOUND_MIN_UPDATES}); rigid pose history failed."
+        )
+        return None, debug
+
+    # Reference pose: the seed frame if solvable, else the earliest solved frame.
+    ref_idx = seed_frame_idx if seed_frame_idx in poses_world else min(poses_world)
+    ref_pose_inv = np.linalg.inv(poses_world[ref_idx])
+
+    def _frame_id(idx: int) -> int:
+        if idx < len(clip.samples):
+            return int(clip.samples[idx].get("prefix", clip.frame_start + idx))
+        return int(clip.frame_start + idx)
+
+    pose_history: List[dict] = []
+    for t in sorted(poses_world):
+        delta = (poses_world[t] @ ref_pose_inv).astype(np.float32)
+        pose_history.append(
+            {
+                "frame": _frame_id(t),
+                "pose": delta,
+                "source": "rigid_pnp",
+                "confidence": 1.0,
+                "clip_id": int(clip.clip_id),
+                "theta": 0.0,
+            }
+        )
+    final_pose = np.asarray(pose_history[-1]["pose"], dtype=np.float32)
+    final_points = apply_homogeneous_transform(np.asarray(points, dtype=np.float32), final_pose)
+    colors = np.asarray(colors, dtype=np.float32)
+    if len(colors) != len(points):
+        colors = np.full((len(points), 3), 0.5, dtype=np.float32)
+
+    if debug_dir is not None:
+        try:
+            _save_artipoint_tracks_imagery(
+                debug_dir, rgb_list, tracks_np, visibility_np, label, active_masks=active_masks,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[RigidPnP-Debug] track overlay save failed: {exc}")
+
+    centroid_translation = (
+        float(np.linalg.norm(final_points.mean(axis=0) - np.asarray(points, dtype=np.float32).mean(axis=0)))
+        if len(final_points)
+        else 0.0
+    )
+    _anchor = "hand-anchored" if delta_obj is not None else "track-centroid (no hand)"
+    _rot_method = debug.get("rigid_rotation_method", "pnp")
+    print(
+        f"[RigidLostFound] '{label}': {len(pose_history)} pose updates over {n_frames} frames "
+        f"(seed idx={ref_idx}, {n_queries} corners, {_anchor}); centroid moved {centroid_translation:.3f} m, "
+        f"rotation {rotation_degrees_from_transform(final_pose):.1f} deg ({_rot_method} rotation + {_anchor} translation)."
+    )
+    debug["status"] = "success"
+    debug["failure_reason"] = ""
+    debug["pose_updates"] = int(len(pose_history))
+    debug["used_frames"] = [int(s["frame"]) for s in pose_history]
+    result = {
+        "tracker": "rigid_lostfound_hand",
+        "hand": interaction_hand,
+        "pose_updates": int(len(pose_history)),
+        "initial_pose": np.eye(4, dtype=np.float32),
+        "final_pose": final_pose,
+        "pose_delta": final_pose.astype(np.float32),
+        "initial_points": np.asarray(points, dtype=np.float32),
+        "initial_colors": colors,
+        "final_points": final_points.astype(np.float32),
+        "final_colors": colors,
+        "pose_history": pose_history,
+        "used_frames": [int(s["frame"]) for s in pose_history],
+        "translation_m": centroid_translation,
+        "rotation_deg": rotation_degrees_from_transform(final_pose),
+        "translation_disagreement_m": 0.0,
+        "hand_anchor_mode": "lostfound_hand_anchored" if delta_obj is not None else "pnp_translation_fallback",
+    }
     return result, debug
 
 
@@ -1111,5 +1614,3 @@ def run_lostfound_pose_tracking(
             final_colors = fill
     best['final_colors'] = final_colors
     return best, debug
-
-

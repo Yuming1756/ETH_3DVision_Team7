@@ -123,24 +123,59 @@ def artipoint_filter_occluded_tracks(
     pred_visibility: np.ndarray,
     indices: np.ndarray,
     occlusion_threshold: float = ARTIPOINT_FILTER_OCCLUSION_THRESHOLD,
+    min_lifetime_frames: int = ARTIPOINT_FILTER_OCCLUSION_MIN_LIFETIME_FRAMES,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-    """ArtiPoint filter_occluded_tracks, retaining original track indices."""
+    """ArtiPoint filter_occluded_tracks, retaining original track indices.
+
+    SEED-RELATIVE visibility: with online (causal) CoTracker we re-seed fresh
+    corners on the live SAM3 mask across ALL active frames, so a point first
+    seeded mid-swing (e.g. on a textureless door at frame 50 of 110) can only
+    ever be visible from its seed frame onward. The original ArtiPoint filter
+    measured visibility as a fraction of the WHOLE clip, which nukes every
+    re-seed (a frame-50 seed maxes out at ~55%) and leaves only the early
+    begin-seeded points — exactly the ones that die when the door goes
+    textureless. We instead score each track over its OWN lifetime span
+    (first->last visible frame): a re-seed that tracks cleanly for its lifetime
+    is kept; a flaky in/out track is dropped. A minimum-lifetime guard prevents
+    1-2 frame blips (frac=1.0 over a 2-frame span) from slipping through.
+    """
     if pred_visibility.shape[1] == 0:
         return pred_3d_tracker, pred_visibility, indices, {"stage": "filter_occluded_tracks", "removed": 0, "kept": 0}
-    num_frames = pred_visibility.shape[0]
-    visibility_percentage = np.sum(pred_visibility, axis=0) / max(1, num_frames)
-    visible_enough = visibility_percentage >= (1.0 - float(occlusion_threshold))
+    num_frames, num_tracks = pred_visibility.shape
+    if str(ARTIPOINT_OCCLUSION_FILTER_MODE) == "whole_clip":
+        # ArtiPoint literal: visibility as a fraction of the WHOLE clip. Correct
+        # for ArtiPoint's offline single-seed tracking; nukes online re-seeds.
+        visibility_percentage = np.sum(pred_visibility, axis=0) / max(1, num_frames)
+        visible_enough = visibility_percentage >= (1.0 - float(occlusion_threshold))
+        score = visibility_percentage
+        mode_meta = {"occlusion_filter_mode": "whole_clip"}
+    else:
+        # seed_relative: score each track over its OWN lifetime span.
+        min_lifetime = max(2, int(min_lifetime_frames))
+        visible_enough = np.zeros(num_tracks, dtype=bool)
+        score = np.zeros(num_tracks, dtype=np.float32)
+        for track_idx in range(num_tracks):
+            where = np.flatnonzero(pred_visibility[:, track_idx])
+            if where.size == 0:
+                continue
+            span = int(where[-1]) - int(where[0]) + 1
+            frac = float(where.size) / float(max(1, span))
+            score[track_idx] = frac
+            visible_enough[track_idx] = (span >= min_lifetime) and (frac >= (1.0 - float(occlusion_threshold)))
+        mode_meta = {"occlusion_filter_mode": "seed_relative", "min_lifetime_frames": int(min_lifetime)}
+    meta = {
+        "stage": "filter_occluded_tracks",
+        "occlusion_threshold": float(occlusion_threshold),
+        "removed": int(np.count_nonzero(~visible_enough)),
+        "kept": int(np.count_nonzero(visible_enough)),
+        "median_score": float(np.median(score)) if len(score) else 0.0,
+    }
+    meta.update(mode_meta)
     return (
         pred_3d_tracker[:, visible_enough],
         pred_visibility[:, visible_enough],
         indices[visible_enough],
-        {
-            "stage": "filter_occluded_tracks",
-            "occlusion_threshold": float(occlusion_threshold),
-            "removed": int(np.count_nonzero(~visible_enough)),
-            "kept": int(np.count_nonzero(visible_enough)),
-            "median_visibility_fraction": float(np.median(visibility_percentage)) if len(visibility_percentage) else 0.0,
-        },
+        meta,
     )
 
 
@@ -262,6 +297,7 @@ def filter_artipoint_tracks(
     valid_tracks: np.ndarray,
     query_points_world: Optional[np.ndarray] = None,
     prior_surface_points: Optional[np.ndarray] = None,
+    apply_prior_surface_filter: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Run ArtiPoint's frontend filters in the same order as artipoint.py.
 
@@ -295,13 +331,33 @@ def filter_artipoint_tracks(
     if original_count == 0:
         return tracks, valid, np.zeros((0,), dtype=bool), debug
 
-    for filter_fn in (
-        artipoint_filter_non_smooth_tracks,
-        artipoint_filter_static_tracks_absolute,
-        artipoint_median_filter,
-        artipoint_filter_occluded_tracks,
-        artipoint_filter_outlier_tracks,
-    ):
+    # ArtiPoint's literal articulated frontend: non_smooth -> median ->
+    # occluded -> outlier (then smooth, applied downstream). Our two extra
+    # filters (absolute static-motion floor + prior-surface gate) are dropped
+    # when ARTIPOINT_LITERAL_FILTERS is set so the chain matches the paper repo.
+    if ARTIPOINT_LITERAL_FILTERS:
+        filter_chain = (
+            artipoint_filter_non_smooth_tracks,
+            artipoint_median_filter,
+            artipoint_filter_occluded_tracks,
+            artipoint_filter_outlier_tracks,
+        )
+        debug["disabled_filters"].append("filter_static_tracks_absolute(non_artipoint)")
+        debug["filter_mode"] = "artipoint_literal"
+    else:
+        filter_chain = (
+            artipoint_filter_non_smooth_tracks,
+            artipoint_filter_static_tracks_absolute,
+            artipoint_median_filter,
+            artipoint_filter_occluded_tracks,
+            artipoint_filter_outlier_tracks,
+        )
+        debug["filter_mode"] = "team_extended"
+    if ARTIPOINT_OCCLUSION_FILTER_MODE == "off":
+        filter_chain = tuple(fn for fn in filter_chain if fn is not artipoint_filter_occluded_tracks)
+        debug["disabled_filters"].append("filter_occluded_tracks(mode=off)")
+    debug["occlusion_filter_mode"] = str(ARTIPOINT_OCCLUSION_FILTER_MODE)
+    for filter_fn in filter_chain:
         if (
             filter_fn is not artipoint_filter_static_tracks_absolute
             and tracks.shape[1] < int(ARTIPOINT_MIN_FILTERED_TRACKS)
@@ -311,14 +367,23 @@ def filter_artipoint_tracks(
         tracks, valid, indices, stage_debug = filter_fn(tracks, valid, indices)
         debug["stages"].append(stage_debug)
 
-    tracks, valid, indices, stage_debug = artipoint_filter_tracks_by_prior_surface(
-        tracks,
-        valid,
-        indices,
-        query_points_world=query_points_world,
-        prior_surface_points=prior_surface_points,
-    )
-    debug["stages"].append(stage_debug)
+    if apply_prior_surface_filter:
+        tracks, valid, indices, stage_debug = artipoint_filter_tracks_by_prior_surface(
+            tracks,
+            valid,
+            indices,
+            query_points_world=query_points_world,
+            prior_surface_points=prior_surface_points,
+        )
+        debug["stages"].append(stage_debug)
+    else:
+        # Rigid transport: the object is CARRIED, so it legitimately moves far from
+        # both the inactive prior and the active seed-frame surface. Anchoring a
+        # surface-proximity gate there would reject the very motion we measure, so
+        # skip it and rely on the non-smooth/static/occluded/outlier filters to
+        # drop hand/background tracks.
+        debug["disabled_filters"].append("filter_tracks_by_prior_surface")
+        debug["stages"].append({"stage": "filter_tracks_by_prior_surface", "skipped": True, "reason": "rigid_transport"})
 
     if tracks.shape[1] < int(ARTIPOINT_MIN_FILTERED_TRACKS):
         debug["fallback"] = "disabled"
