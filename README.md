@@ -794,26 +794,18 @@ object-motion estimation.
 
 Example direct invocation:
 
-```bash
-python3 graph.py \
-  --data-dir data/open-source-183_extracted \
-  --frame-start 280 \
-  --frame-end 690 \
-  --output-dir output/output_final_183_long \
-  --inactive-stride 1 \
-  --inactive-prior-frames 10 \
-  --hf-cache-dir .cache/huggingface \
-  --qwen-vl-model-id "Qwen/Qwen3-VL-4B-Instruct" \
-  --sam-backend sam3
-```
-On the cluster, use one of the SLURM launchers in the repository root. These
-scripts activate the environment, set HuggingFace cache paths/tokens, start the
-required services, and export the relevant environment variables.
+We have prepared the shell script for you to run the codes. 
 
+```bash
+bash ETH_3DVision_Team7/graph.sh
+```
+If you run on the cluster : 
 Example:
 ```bash
-sbatch graph_183_long_4b.sh
+sbatch graph.sh
 ```
+You can try different starting frame and ending frame by changing the **frame-start** and **frame-end 800**. 
+
 **Important: Start on an Inactive Segment**
 The frame window should start before the first interaction. The first clip must
 be inactive so the pipeline can build the pre-interaction object prior. 
@@ -944,7 +936,7 @@ available, articulation-axis errors.
 Example:
 
 ```bash
-python3 eval.py \
+python eval.py \
   --output_dir output/output_final_183_long \
   --groundtruth_dir final_project/annotations/183/bowl \
   --label "bowl"
@@ -963,23 +955,17 @@ The other options for our evaluation are `spoon`(using scene 307), `cabinet door
 
 ## Visualization
 
-### PLY / PyViz3D Export
-**visualize_graph.py** writes graph visualization assets such as:
-```text
-functional_nodes.ply
-functional_edges.ply
-scene_with_graph.ply
-fungraph/
+`viser_io.py` provides a way to visualise the functional scene graph. It can be ran using:
+
+```bash
+python3 viser_io.py \
+  --output-dir output/output_final_183_long \
+  --host 127.0.0.1 \
+  --port 8003 \
+  --groundtruth-dir annotations/183/bowl \
+  --groundtruth-object "bowl"
 ```
 
-Example:
-```text
-python3 visualize_graph.py \
-  --scene-graph-dir output/output_final_183_long/scene_graph \
-  --scene-ply output/output_final_183_long/scene_full.ply \
-  --out-dir output/output_final_183_long \
-  --clip-id -1
-```
 ### Browser HTML Multi-Status Viewer
 **visualize_scene_graph_html_multi_status.py** creates an interactive browser viewer with:
 
@@ -993,7 +979,7 @@ Example:
 ```bash
 RUN=output/output_final_183_long
 
-python3 visualize_scene_graph_html_multi_status.py \
+python visualize_scene_graph_html_multi_status.py \
   --scene-ply "$RUN/scene_full.ply" \
   --graph-json "$RUN/scene_graph/graph.json" \
   --event-jsons $(find "$RUN" -maxdepth 2 -path "$RUN/clip_*/event.json" | sort) \

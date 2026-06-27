@@ -30,9 +30,9 @@ echo "ACTIVE_CLIP_BRIDGE_GAP_FRAMES=$ACTIVE_CLIP_BRIDGE_GAP_FRAMES"
 
 python -u graph.py \
   --data-dir data/open-source-183_extracted \
-  --frame-start 280 \
-  --frame-end 690 \
-  --output-dir output/output_final_183_long_4b \
+  --frame-start 650 \
+  --frame-end 800 \
+  --output-dir output/output_final_183_long_4b_650_800 \
   --jpeg-dir output/tmp_frames_jpeg \
   --inactive-stride 1 \
   --inactive-prior-frames "$INACTIVE_PRIOR_FRAMES" \
