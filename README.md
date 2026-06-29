@@ -792,8 +792,6 @@ object-motion estimation.
 
 ## How to Run
 
-Example direct invocation:
-
 We have prepared the shell script for you to run the codes. 
 
 ```bash
@@ -804,7 +802,7 @@ Example:
 ```bash
 sbatch graph.sh
 ```
-You can try different starting frame and ending frame by changing the **frame-start** and **frame-end 800**. 
+You can try different starting frame and ending frame by changing the **frame-start** and **frame-end**. 
 
 **Important: Start on an Inactive Segment**
 The frame window should start before the first interaction. The first clip must
