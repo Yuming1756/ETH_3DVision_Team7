@@ -1,7 +1,5 @@
 # Dynamic Functional 3D Scene Graph
 
-> **_NOTE:_**  We were unable to confirm in time that the whole pipeline runs as expected. In case of any issues contact thouben@student.ethz.ch or check our repository https://github.com/Yuming1756/ETH_3DVision_Team7/tree/main
-
 `graph.py` builds a **dynamic functional 3D scene graph** from a single egocentric
 RGB-D recording. Given RGB-D frames, camera poses, hand tracks, and hand-object
 interaction cues, the pipeline reconstructs:
